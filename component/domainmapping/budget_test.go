@@ -132,7 +132,10 @@ func TestHTTPRejectsCompleteResponseWhenBudgetExpiresAtEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := newHTTPProvider(testConfig("http://127.0.0.1/lookup").Providers[0], DefaultTimeout, DefaultMaxConnections)
+	p, err := newHTTPProvider(testConfig("http://127.0.0.1/lookup").Providers[0], DefaultTimeout, DefaultMaxConnections)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer p.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()

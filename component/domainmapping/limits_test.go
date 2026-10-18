@@ -178,7 +178,10 @@ func TestHTTPConnectionQueueUsesOriginalBudget(t *testing.T) {
 		once.Do(func() { close(release) })
 		server.Close()
 	}()
-	p := newHTTPProvider(testConfig(server.URL).Providers[0], 2*time.Second, 1)
+	p, err := newHTTPProvider(testConfig(server.URL).Providers[0], 2*time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer p.CloseIdleConnections()
 	first := make(chan error, 1)
 	firstCtx, cancelFirst := context.WithTimeout(context.Background(), 2*time.Second)
@@ -205,7 +208,10 @@ func TestHTTPConnectionQueueUsesOriginalBudget(t *testing.T) {
 }
 
 func TestTransportDetachedDialRestoresLookupCancellation(t *testing.T) {
-	p := newHTTPProvider(testConfig("http://127.0.0.1:1/lookup").Providers[0], time.Second, 1)
+	p, err := newHTTPProvider(testConfig("http://127.0.0.1:1/lookup").Providers[0], time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer p.CloseIdleConnections()
 	started, finished := make(chan context.Context, 1), make(chan error, 1)
 	p.transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {

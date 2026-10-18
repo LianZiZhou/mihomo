@@ -62,7 +62,12 @@ func New(cfg Config) (*Runtime, error) {
 		maxConnections = DefaultMaxConnections
 	}
 	for _, cfg := range cfg.Providers {
-		runtime.providers = append(runtime.providers, newHTTPProvider(cfg, runtime.timeout, maxConnections))
+		provider, err := newHTTPProvider(cfg, runtime.timeout, maxConnections)
+		if err != nil {
+			runtime.Retire()
+			return nil, err
+		}
+		runtime.providers = append(runtime.providers, provider)
 	}
 	return runtime, nil
 }
@@ -157,7 +162,7 @@ func (r *Runtime) lookup(key lookupKey, f *flight) {
 	close(f.done)
 	r.mu.Unlock()
 	if r.retired.Load() {
-		r.closeIdleConnections()
+		r.releaseConnections()
 	}
 }
 
@@ -168,13 +173,20 @@ func (r *Runtime) Retire() {
 		r.mu.Lock()
 		r.retired.Store(true)
 		r.mu.Unlock()
-		r.closeIdleConnections()
+		r.releaseConnections()
 	}
 }
 
-func (r *Runtime) closeIdleConnections() {
+func (r *Runtime) releaseConnections() {
+	r.mu.Lock()
+	finished := r.retired.Load() && r.active == 0
+	r.mu.Unlock()
 	for _, provider := range r.providers {
-		provider.CloseIdleConnections()
+		if closer, ok := provider.(interface{ Close() }); ok && finished {
+			closer.Close()
+		} else {
+			provider.CloseIdleConnections()
+		}
 	}
 }
 

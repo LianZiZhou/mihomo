@@ -78,11 +78,13 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 
 默认最多接纳 128 个尚未结束的共享查询，所有 provider 共用这个运行时额度。等待 HTTP 连接的查询已经占用额度，容量满后新的不同查询立即以 `overloaded` 回退，没有另外增长的等待队列。已有相同客户端/IP 且尚未到期的查询仍可加入共享。查询超时之后，如果 provider 尚未退出，额度继续保留到它实际结束；反复请求不能绕过上限积累后台工作。
 
-每个 provider 使用独立连接池，默认最多 16 条连接，空闲池也使用相同上限。普通本机 HTTP 使用 HTTP/1.1 长连接；HTTPS 保留正常证书验证及 HTTP/2 协商，HTTP/2 可在同一连接上承载多个查询，因此连接数和在途查询数是不同的限制。未复用连接时才增加建连成本，复用时仍需一次 HTTP 请求往返。多个 provider 的连接上限分别计算。
+每个 provider 使用独立连接池，默认最多 16 条连接，空闲池也使用相同上限。额度从 TCP 拨号开始持有，直到实际连接关闭后释放，HTTP/2 协议接管或 GOAWAY 不会提前释放额度。普通本机 HTTP 使用 HTTP/1.1 长连接；HTTPS 保留正常证书验证及 HTTP/2 协商，HTTP/2 可在同一连接上承载多个查询，因此连接数和在途查询数是不同的限制。流名额不足时在原查询预算内等待。未复用连接时才增加建连成本，复用时仍需一次 HTTP 请求往返。多个 provider 的连接上限分别计算。
 
-等待连接、TCP 建立及 TLS 握手沿用最初查询的绝对截止时间；不会在排到连接或进入握手时重新获得完整预算。实现将查询的截止时间及取消信号恢复到 Transport 的拨号上下文，避免请求已超时但后台仍沿用默认 30 秒拨号时间。默认 50 毫秒是本桥接等待预算，不是整个业务建连的硬实时上限：调度和 GC 可能带来额外延迟，回退后的原有嗅探与出站拨号也另有成本。
+为避免 HTTP/2 依赖库在多个请求同时预留流时互相等待，每个 HTTPS provider 串行处理流预留及请求头发送阶段，已发送请求的响应仍可并行。新建 HTTP/2 连接时，第一个请求收到响应头或结束后才放行后续请求，确保服务端初始 SETTINGS 已处理；首个响应较慢时会暂时延迟后续查询，但等待仍计入各自原预算，不增加探测请求或额外往返。连接重建后同样适用。
 
-MosDNS 的 `domain_mapping.args.api` 可配置 `max_concurrent`（默认 128）及 `timeout`（默认 1000 毫秒）；lookup 和 stats 共用服务端额度，超额请求和查询超时尝试返回 HTTP 503，应答写入也受服务端的绝对截止时间约束。若截止时间已到或 headers 已经发出，客户端可能只收到连接关闭或不完整应答，不能保证 503 送达。非 200 响应或不完整响应按 provider 错误处理，可在剩余预算内继续下一个 provider；服务端 `/v1/stats` 的 `api_rejected` 和 `api_timeouts` 可辅助区分服务端容量与超时。服务端额度统计 handler 执行，不是整个 HTTP 服务器的 socket 上限。降低上限会减少资源占用，也可能降低突发时的映射成功率，需结合目标设备的 CPU、内存及 DNS 应答延迟调节。
+等待连接、TCP 建立及 TLS 握手沿用最初查询的绝对截止时间；不会在排到连接或进入握手时重新获得完整预算。实现将查询的截止时间及取消信号恢复到 Transport 的拨号上下文，避免请求已超时但后台仍沿用默认 30 秒拨号时间。为使单个拨号额度对应最多一个 TCP 建连尝试，不并行竞速 IPv4/IPv6；本机部署建议使用字面 IP。默认 50 毫秒是本桥接等待预算，不是整个业务建连的硬实时上限：调度和 GC 可能带来额外延迟，回退后的原有嗅探与出站拨号也另有成本。
+
+MosDNS 的 `domain_mapping.args.api` 可配置 `max_concurrent`（默认 128）及 `timeout`（默认 1000 毫秒）；lookup 和 stats 共用服务端额度，超额请求和查询超时尝试返回 HTTP 503。请求体读取与应答写入共享服务端的绝对截止时间，包括 HTTP 自动排空未完成的请求体及最后 flush，避免声明 Content-Length 或分块请求体后停止发送的连接长期占住额度。若截止时间已到或 headers 已经发出，客户端可能只收到连接关闭或不完整应答，不能保证 503 送达。非 200 响应或不完整响应按 provider 错误处理，可在剩余预算内继续下一个 provider；服务端 `/v1/stats` 的 `api_rejected` 和 `api_timeouts` 可辅助区分服务端容量与超时。服务端额度统计 handler 执行，不是整个 HTTP 服务器的 socket 上限；该超时从进入插件 handler 开始，不包含此前的请求头读取。降低上限会减少资源占用，也可能降低突发时的映射成功率，需结合目标设备的 CPU、内存及 DNS 应答延迟调节。
 
 ## HTTP API v1
 
@@ -144,9 +146,9 @@ type Provider interface {
 
 这是编译期扩展，不加载动态 `.so` 插件。增加 provider 类型时，实现接口，并同时扩展 `Validate` 的配置校验和 `New` 中的 provider 构造分派。`Lookup` 必须遵守 `ctx`，返回合法且有效的域名证据，不改写连接目的地址；设置 `Result.Provider` 供诊断使用。自定义实现应提供与 HTTP v1 相当的证据校验，运行时不会替其验证任意结果。
 
-运行时可以停止等待并拒绝过期结果，但无法强制终止 Go goroutine。扩展 provider 必须限制自身工作量、响应取消并释放资源，不能依靠等待方超时回收其内部任务。`max-inflight` 限制 Runtime 发起的工作数量，不限制 provider 自行创建的额外 goroutine、连接或内存。
+运行时可以停止等待并拒绝过期结果，但无法强制终止 Go goroutine。扩展 provider 必须限制自身工作量、响应取消并释放资源，不能依靠等待方超时回收其内部任务。`max-inflight` 限制 Runtime 发起的工作数量，不限制 provider 自行创建的额外 goroutine、连接或内存。provider 可额外实现幂等的 `Close()` 方法，在运行时退休且所有已接纳查询结束后执行终态清理；未实现时仍调用 `CloseIdleConnections()`。
 
-`Runtime` 负责查询总预算、容量限制和并发合并，`Manager` 使用原子指针替换运行时，独立于 `resolver.DefaultHostMapper`。配置解析先校验配置；应用配置时切换到新运行时。已有在途请求仍由旧运行时完成，不因重载中止；旧运行时拒绝新查询，关闭空闲 HTTP 连接，并在请求完成后再次回收连接。上限按运行时及 provider 计算，重载期间新旧运行时的资源可以暂时并存，并非整个进程永远只有一份连接上限。关闭 `enable` 后新连接不再查询，已建立 TCP/UDP 会话保持既有路由。
+`Runtime` 负责查询总预算、容量限制和并发合并，`Manager` 使用原子指针替换运行时，独立于 `resolver.DefaultHostMapper`。配置解析先校验配置；应用配置时切换到新运行时。已有在途请求仍由旧运行时完成，不因重载中止；旧运行时拒绝新查询，关闭空闲 HTTP 连接，并在全部查询完成后关闭剩余底层连接。收到 HTTP/2 GOAWAY 后，连接退出复用池并等待已有流完成；清理最多等待一个配置的查询预算，随后关闭连接，避免对端保留空闲 TCP 占住最后一个额度。上限按运行时及 provider 计算，重载期间新旧运行时的资源可以暂时并存，并非整个进程永远只有一份连接上限。关闭 `enable` 后新连接不再查询，已建立 TCP/UDP 会话保持既有路由。
 
 新增 UDP 多包嗅探包装器若保留嗅探状态，可实现可选 `SkipSniff()` 方法：只清理嗅探缓冲和等待状态，不关闭底层 `PacketSender`，也不丢弃排队数据。现有 QUIC 包装器已经实现该方法。
 
@@ -165,11 +167,11 @@ go test ./component/domainmapping ./constant ./component/sniffer ./tunnel ./conf
 go vet ./component/domainmapping ./constant ./component/sniffer ./tunnel ./config ./hub/executor
 ```
 
-测试覆盖协议验证、过期、超时恢复、HTTP 连接复用、无正负结果缓存、并发合并与独立取消、客户端隔离、多 provider 顺序、重载、独立于 DNS 的配置、规则域名和目的 IP 保持、fake-IP/显式域名兼容、TCP 跳过嗅探、UDP 入口非阻塞和排队数据保留。资源限制的验收包括连接队列使用原预算、饱和后既有共享仍可加入、迟到 provider 继续占用额度直到退出、TCP/TLS 取消回收及 HTTPS HTTP/2 兼容；跨进程脚本还覆盖新 Mihomo 与忽略 `view` 的旧 API 兼容。
+测试覆盖协议验证、过期、超时恢复、HTTP 连接复用、无正负结果缓存、并发合并与独立取消、客户端隔离、多 provider 顺序、重载、独立于 DNS 的配置、规则域名和目的 IP 保持、fake-IP/显式域名兼容、TCP 跳过嗅探、UDP 入口非阻塞和排队数据保留。资源限制的验收包括连接队列使用原预算、饱和后既有共享仍可加入、迟到 provider 继续占用额度直到退出及 TCP/TLS 取消回收。真实 TLS 回归覆盖 HTTP/2 单流饱和恢复、多流响应并行、冷启动与连接重建后的突发、GOAWAY 清理、活动流退休及 HTTPS HTTP/1.1 回退；跨进程脚本还覆盖新 Mihomo 与忽略 `view` 的旧 API 兼容。
 
 性能验收应同时观察映射查询延迟、DNS 应答延迟和资源峰值，覆盖大索引桶、批量过期、突发新目标及不可用 provider。容量限制与精简 JSON 不构成目标设备 p99 延迟的保证；ARM/MIPS 设备仍需实测。
 
-本轮精简查询与资源限制已通过两仓库的 `go test ./...` 及相关包 `go vet`。Windows 直接可信 ECS 与 WSL Linux amd64 的真实 dnsmasq 2.92 跨进程链路各通过 1000/1000 条 TCP 连接、100/100 个 UDP 会话，覆盖 route/full 一致性、过期回退、重载及旧 API 兼容；Linux 链路同时通过 ECS 策略与缓存隔离、TCP DNS、UDP 截断、相关 HTTPS Additional 及 provider 不可用后的原嗅探回退。Linux arm64 和 mipsle softfloat 的两个内核均交叉编译成功，尚未在目标设备运行。MosDNS 的实际阻塞写入测试覆盖完整响应 handler、精简响应的最后 flush 及 keepalive 后续响应。这些检查不替代 OpenWRT 实机性能与透明代理验收。
+本轮精简查询与资源限制已通过两仓库的 `go test ./...` 及相关包 `go vet`。Windows 直接可信 ECS 与 WSL Linux amd64 的真实 dnsmasq 2.92 跨进程链路各通过 1000/1000 条 TCP 连接、100/100 个 UDP 会话，覆盖 route/full 一致性、过期回退、重载及旧 API 兼容；Linux 链路同时通过 ECS 策略与缓存隔离、TCP DNS、UDP 截断、相关 HTTPS Additional 及 provider 不可用后的原嗅探回退。Linux arm64 和 mipsle softfloat 的两个内核均交叉编译成功，尚未在目标设备运行。MosDNS 的真实 TCP 回归覆盖阻塞写入、完整/精简/stats 请求的不完整 Content-Length、分块数据与 trailer、超额拒绝后的连接清理及 keepalive 后续请求。这些检查不替代 OpenWRT 实机性能与透明代理验收。
 
 有受支持的 C 编译器及 CGO 环境时，可额外运行：
 

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/metacubex/mihomo/common/contextutils"
 	M "github.com/metacubex/sing/common/metadata"
+	"golang.org/x/net/http2"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -101,34 +104,54 @@ func Validate(cfg Config) error {
 }
 
 type httpProvider struct {
-	name      string
-	endpoint  *url.URL
-	client    *http.Client
-	transport *http.Transport
+	name        string
+	endpoint    *url.URL
+	client      *http.Client
+	transport   *http.Transport
+	h2Idle      *http2.Transport
+	connections *connectionLimiter
+	connectGate *semaphore.Weighted
 }
 
-func newHTTPProvider(cfg ProviderConfig, timeout time.Duration, maxConnections int) *httpProvider {
+func newHTTPProvider(cfg ProviderConfig, timeout time.Duration, maxConnections int) (*httpProvider, error) {
 	endpoint, _ := url.Parse(cfg.Endpoint) // validated by New
-	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// The bridge must not depend on system HTTP proxy configuration or itself
-	// enter Mihomo's proxy-selection path.
-	transport.Proxy = nil
-	transport.MaxConnsPerHost = maxConnections
-	transport.MaxIdleConnsPerHost = maxConnections
-	transport.MaxIdleConns = maxConnections
-	transport.DisableCompression = true
+	// enter Mihomo's proxy-selection path. Own the transport and its protocol
+	// registrations instead of inheriting a mutable global DefaultTransport.
+	transport := &http.Transport{
+		MaxConnsPerHost: maxConnections, MaxIdleConnsPerHost: maxConnections,
+		MaxIdleConns: maxConnections, IdleConnTimeout: 90 * time.Second,
+		DisableCompression: true, ForceAttemptHTTP2: true,
+		TLSHandshakeTimeout: timeout, ExpectContinueTimeout: time.Second,
+	}
+	h2, err := http2.ConfigureTransports(transport)
+	if err != nil {
+		return nil, fmt.Errorf("configure domain-mapping HTTP/2: %w", err)
+	}
+	// MaxConnsPerHost alone does not bound HTTP/2 sockets. When a stream is
+	// unavailable, wait on the existing connection using the request context;
+	// dialing behind a socket semaphore alone would strand these requests.
+	h2.StrictMaxConcurrentStreams = true
+	pool := h2.ConnPool
+	h2.ConnPool = newDrainingPool(pool, timeout)
+	// The original pool has a private idle-close hook. Keep an explicit handle
+	// to it because the lifecycle wrapper cannot implement that private method.
+	h2Idle := &http2.Transport{ConnPool: pool}
+	connections := newConnectionLimiter(maxConnections)
 	// A request deadline does not normally cancel Transport's detached dial.
 	// Restore the lookup lifetime for both TCP establishment and TLS handshakes.
-	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	// Disable speculative IPv4/IPv6 racing: one acquired socket slot must not
+	// create two simultaneous TCP connection attempts inside net.Dialer.
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second, FallbackDelay: -1}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		ctx, cancel := restoreDialContext(ctx, timeout)
 		defer cancel()
-		return dialer.DialContext(ctx, network, address)
+		return connections.DialContext(ctx, network, address, dialer.DialContext)
 	}
 	transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		ctx, cancel := restoreDialContext(ctx, timeout)
 		defer cancel()
-		conn, err := dialer.DialContext(ctx, network, address)
+		conn, err := connections.DialContext(ctx, network, address, dialer.DialContext)
 		if err != nil {
 			return nil, err
 		}
@@ -136,6 +159,7 @@ func newHTTPProvider(cfg ProviderConfig, timeout time.Duration, maxConnections i
 		if transport.TLSClientConfig != nil {
 			tlsConfig = transport.TLSClientConfig.Clone()
 		}
+		tlsConfig.NextProtos = []string{http2.NextProtoTLS, "http/1.1"}
 		if tlsConfig.ServerName == "" {
 			tlsConfig.ServerName = endpoint.Hostname()
 		}
@@ -146,22 +170,29 @@ func newHTTPProvider(cfg ProviderConfig, timeout time.Duration, maxConnections i
 		}
 		return tlsConn, nil
 	}
-	// Preserve Transport's standard HTTP/2 setup. RoundTrip initializes its
-	// ALPN configuration before invoking DialTLSContext, which clones it above.
-	transport.ForceAttemptHTTP2 = true
-	transport.TLSHandshakeTimeout = timeout
 	return &httpProvider{
 		name: cfg.Name, endpoint: endpoint, transport: transport,
+		h2Idle: h2Idle, connections: connections, connectGate: semaphore.NewWeighted(1),
 		client: &http.Client{
 			Transport: transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return errors.New("domain-mapping redirects are not supported")
 			},
 		},
-	}
+	}, nil
 }
 
-func (p *httpProvider) CloseIdleConnections() { p.transport.CloseIdleConnections() }
+func (p *httpProvider) CloseIdleConnections() {
+	p.transport.CloseIdleConnections()
+	p.h2Idle.CloseIdleConnections()
+}
+
+// Close is terminal and is called only after a retired runtime has no admitted
+// lookups left. It also covers connections removed from the HTTP/2 idle pool.
+func (p *httpProvider) Close() {
+	p.connections.Close()
+	p.CloseIdleConnections()
+}
 
 type lookupBudgetContextKey struct{}
 
@@ -218,12 +249,27 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 	}
 	endpoint.RawQuery = query.Encode()
 	reqCtx := context.WithValue(ctx, lookupBudgetContextKey{}, ctx)
+	if endpoint.Scheme == "https" {
+		admission := &headerAdmission{gate: p.connectGate}
+		if err := admission.acquire(ctx); err != nil {
+			return result, err
+		}
+		defer admission.release()
+		reqCtx = context.WithValue(reqCtx, headerAdmissionKey{}, admission)
+		reqCtx = httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
+			GotConn: admission.gotConn, WroteHeaders: admission.wroteHeaders,
+			GotFirstResponseByte: admission.release,
+		})
+	}
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
 		return result, err
 	}
 	req.Header.Set("Accept", "application/json")
 	response, err := p.client.Do(req)
+	if admission, _ := reqCtx.Value(headerAdmissionKey{}).(*headerAdmission); admission != nil {
+		admission.release()
+	}
 	if err != nil {
 		return result, err
 	}
