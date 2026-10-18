@@ -72,6 +72,10 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 
 相同客户端 IP 与目标 IP 的并发查询共享一个在途请求。单个调用方取消等待，不会取消其他调用方共享的查询。完成后的成功结果、未命中和错误均不缓存：共享 IP 的域名归属可能在旧记录 TTL 到期前发生变化。HTTP 连接本身继续复用，不执行应用层重试。
 
+MosDNS 支持独立的证据保留策略，推荐在其 `domain_mapping.args` 设置 `size: 262144` 和 `retention: {mode: lru, ttl_multiplier: 10, min_window: 300, max_window: 86400}`。`lru` 不因 DNS TTL 或路由窗口届满删除映射，直到容量淘汰；同客户端路由命中刷新有效期至至少 `now + clamp(10 × baseTTL, 300s, 86400s)`。例如 TTL 300 秒，每次命中延至至少 50 分钟后。仅修改 Mihomo 的 DNS cache 大小或 fake-IP TTL 不会改变 MosDNS 这份索引。完整配置见 [MosDNS 保留策略](https://github.com/LianZiZhou/mosdns/blob/main/docs/mihomo-bridge.md#dns-到期路由续期与容量淘汰)。
+
+使用新策略时，连接诊断额外包含 `dnsExpiresAt`、`dnsStale`（为 true 时输出）和 `retentionMode`；`expiresAt` 表示查询返回时的路由有效期。真实 DNS 截止已过去而路由证据仍有效是正常情况。上述字段是创建连接时的快照，已有连接不随 DNS TTL 或路由有效期到期而重新分流。Mihomo 仍校验 `expires_at` 晚于当前时间，不会因 `dns_stale=true` 接受已过期的路由租约。
+
 共享请求使用固定截止时间，后加入者只等待剩余预算；已过期但尚未退出的 provider 不会让新请求继承旧超时。等待方独立执行超时回退，provider 在截止时间之后返回的结果不会应用到分流。
 
 ### 资源与延迟边界
@@ -97,7 +101,7 @@ Accept: application/json
 
 `ip` 是目标 IPv4/IPv6；`client` 是入站源 IP，不包含端口。源 IP 不可用时省略 `client`，由 MosDNS 查询全局索引。IPv4 映射 IPv6 地址先转换成普通 IPv4；IPv6 参数由 HTTP 客户端自动进行 URL 编码。
 
-Mihomo 始终设置 `view=route`，请求仅包含选中域名证据的精简 JSON。此视图与默认完整视图的区别只有省略 `candidates`，hit 和 miss 都不发送候选字段。旧 MosDNS 忽略 `view` 参数并返回完整 v1 响应时仍然兼容，不增加能力探测请求。人工诊断可省略 `view` 或设置 `view=full`。
+Mihomo 始终设置 `view=route`，请求仅包含选中域名证据的精简 JSON，hit 和 miss 都不发送 `candidates`。在 MosDNS 的 `sliding` / `lru` 模式下，该视图还表示真实选路访问，可刷新访问 LRU，客户端命中还续期；默认完整视图只诊断、不续期。全局命中不延长其他客户端记录的存储有效期。旧 MosDNS 忽略 `view` 参数并返回完整 v1 响应时仍然兼容，不增加能力探测请求。人工诊断可省略 `view` 或设置 `view=full`。
 
 命中示例（时间仅演示格式，实时应答必须填写实际尚未过期的时间）：
 
@@ -129,7 +133,9 @@ Mihomo 始终设置 `view=route`，请求仅包含选中域名证据的精简 JS
 
 两者均返回 HTTP 200；非法请求参数由 MosDNS 返回 400。客户端要求响应 `version=1`、`ip` 与请求匹配、状态为 `hit` 或 `miss`；命中时还要求合法域名、`scope` 为 `client` 或 `global`，且 **`expires_at` 必填并晚于当前时间**。时间使用 Go `time.Time` 兼容的 RFC3339/RFC3339Nano 格式。域名统一小写并去除一个末尾点。非 200 响应、无效 JSON、过期证据或超过 1 MiB 的应答均按查询失败回退。
 
-MosDNS 优先客户端索引，再回退全局索引。多个有效候选存在时，服务端选择最近观察的域名并设置 `conflict=true`；Mihomo 使用服务返回的选中域名，诊断字段保留冲突信息。这是兼容既定分流行为的选择，不能消除共享 IP 的歧义。
+MosDNS 优先客户端索引，再回退全局索引。多个保留的域名候选存在时，服务端选择最近实际 DNS 观察的域名并设置 `conflict=true`；路由查询续期只改变访问热度和有效期，不改变 DNS 观察顺序。Mihomo 使用服务返回的选中域名，诊断字段保留冲突信息。LRU 保留会延长歧义记录的寿命，不能证明选中的域名就是应用真实意图。
+
+v1 可选字段 `dns_expires_at`、`dns_stale`、`retention_mode` 只用于诊断；`expires_at` 始终是 provider 接受命中的有效期判据。旧服务不提供这些字段时保持原行为，旧 Mihomo 也可忽略新字段并使用新 MosDNS 返回的未来路由有效期。新模式不会增加协议版本探测或额外查询。
 
 MosDNS 完整视图中的 `candidates` 最多列出最近 32 个不同域名，仅供诊断，不代表索引的完整内容。收到完整响应时，Mihomo HTTP provider 校验整份 JSON 的语法，但不解码和复制候选列表；分流使用顶层选中域名、有效期及冲突标记。更早服务返回的较大候选列表仍受 1 MiB 响应上限约束。精简查询直接使用 MosDNS 维护的最新记录及不同域名计数，不需要先构造完整诊断列表再丢弃。
 
@@ -154,7 +160,7 @@ type Provider interface {
 
 ## 能力边界与验证
 
-ECH、不可识别的 QUIC 数据、分片或报文嗅探失败不会阻止已有 DNS 映射参与分流。本功能依赖实际观察到的 DNS 关联，不解密 ECH 内层域名。客户端绕过 MosDNS、索引重启后尚未积累、TTL 过期或不同域名共享目标 IP 时，仍可能未命中或出现歧义。
+ECH、不可识别的 QUIC 数据、分片或报文嗅探失败不会阻止已有 DNS 映射参与分流。本功能依赖实际观察到的 DNS 关联，不解密 ECH 内层域名。客户端绕过 MosDNS、索引重启后尚未积累、容量淘汰、严格 TTL / sliding 模式到期或不同域名共享目标 IP 时，仍可能未命中或出现歧义。
 
 DNS 请求的 IPv4、IPv6、隐私地址并不会自动关联成同一设备。跨地址族可能回退全局索引。HTTP/2、HTTP/3 连接合并和多路复用还可能让多个域名共用已建立的连接；首次分流不能为同一连接内每个后续请求重新选择出站，因此不承诺所有实际流量 100% 正确归因。
 

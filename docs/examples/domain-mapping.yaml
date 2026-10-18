@@ -1,6 +1,9 @@
 # 合并到现有 Mihomo 配置；入站、代理和规则沿用你的部署。
 # 要求 MosDNS 已加载 domain_mapping 插件，且 tag 为 domain_index。
 # MosDNS API 仅监听可信本机地址，例如 127.0.0.1:9091。
+# 在 MosDNS domain_mapping.args 设置 size: 262144 和
+# retention: {mode: lru, ttl_multiplier: 10, min_window: 300, max_window: 86400}
+# 可保留客户端超 TTL 使用的域名证据；这些参数由 MosDNS 配置，不放在本段中。
 domain-mapping:
   enable: true
   # 所有 provider 共享的查询预算，单位毫秒；省略或 0 时为 50。

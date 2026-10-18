@@ -117,15 +117,27 @@ func (r *Runtime) Lookup(ctx context.Context, clientIP, destinationIP netip.Addr
 			return Result{}, err
 		}
 		result := f.result
-		// Callers own the returned slice; concurrent consumers cannot mutate
+		// Callers own the returned slice and timestamps; consumers cannot mutate
 		// each other's evidence after the flight has completed. The HTTP
 		// provider skips candidates; custom providers may still supply them.
 		result.Candidates = append([]Candidate(nil), result.Candidates...)
+		result.DNSExpiresAt = copyTimestamp(result.DNSExpiresAt)
+		for i := range result.Candidates {
+			result.Candidates[i].DNSExpiresAt = copyTimestamp(result.Candidates[i].DNSExpiresAt)
+		}
 		if err := lookupContextError(waitCtx); err != nil {
 			return Result{}, err
 		}
 		return result, f.err
 	}
+}
+
+func copyTimestamp(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func (r *Runtime) lookup(key lookupKey, f *flight) {

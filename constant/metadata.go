@@ -225,12 +225,15 @@ type Metadata struct {
 }
 
 type DomainResolution struct {
-	Provider     string    `json:"provider,omitempty"`
-	Source       string    `json:"source,omitempty"`
-	LookupStatus string    `json:"lookupStatus"`
-	Scope        string    `json:"scope,omitempty"`
-	Conflict     bool      `json:"conflict"`
-	ExpiresAt    time.Time `json:"expiresAt,omitempty"`
+	Provider      string     `json:"provider,omitempty"`
+	Source        string     `json:"source,omitempty"`
+	LookupStatus  string     `json:"lookupStatus"`
+	Scope         string     `json:"scope,omitempty"`
+	Conflict      bool       `json:"conflict"`
+	ExpiresAt     time.Time  `json:"expiresAt,omitempty"`
+	DNSExpiresAt  *time.Time `json:"dnsExpiresAt,omitempty"`
+	DNSStale      bool       `json:"dnsStale,omitempty"`
+	RetentionMode string     `json:"retentionMode,omitempty"`
 }
 
 func (m *Metadata) RemoteAddress() string {

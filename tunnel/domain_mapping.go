@@ -29,6 +29,7 @@ func lookupDomainMapping(ctx context.Context, metadata *C.Metadata) bool {
 	diagnostic := &C.DomainResolution{
 		Provider: result.Provider, Source: result.Source, LookupStatus: result.Status,
 		Scope: result.Scope, Conflict: result.Conflict, ExpiresAt: result.ExpiresAt,
+		DNSExpiresAt: result.DNSExpiresAt, DNSStale: result.DNSStale, RetentionMode: result.RetentionMode,
 	}
 	metadata.DomainResolution = diagnostic
 	if err != nil {

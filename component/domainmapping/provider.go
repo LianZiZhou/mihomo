@@ -53,24 +53,32 @@ type Provider interface {
 }
 
 type Candidate struct {
-	Domain     string    `json:"domain"`
-	Source     string    `json:"source,omitempty"`
-	ObservedAt time.Time `json:"observed_at,omitempty"`
-	ExpiresAt  time.Time `json:"expires_at,omitempty"`
+	Domain        string     `json:"domain"`
+	Source        string     `json:"source,omitempty"`
+	ObservedAt    time.Time  `json:"observed_at,omitempty"`
+	ExpiresAt     time.Time  `json:"expires_at,omitempty"`
+	DNSExpiresAt  *time.Time `json:"dns_expires_at,omitempty"`
+	DNSStale      bool       `json:"dns_stale,omitempty"`
+	RetentionMode string     `json:"retention_mode,omitempty"`
 }
 
 type Result struct {
-	Version    int         `json:"version"`
-	Status     string      `json:"status"`
-	IP         string      `json:"ip"`
-	Domain     string      `json:"domain,omitempty"`
-	Scope      string      `json:"scope,omitempty"`
-	Source     string      `json:"source,omitempty"`
-	ObservedAt time.Time   `json:"observed_at,omitempty"`
-	ExpiresAt  time.Time   `json:"expires_at,omitempty"`
-	Conflict   bool        `json:"conflict"`
-	Candidates []Candidate `json:"candidates,omitempty"`
-	Provider   string      `json:"-"`
+	Version    int       `json:"version"`
+	Status     string    `json:"status"`
+	IP         string    `json:"ip"`
+	Domain     string    `json:"domain,omitempty"`
+	Scope      string    `json:"scope,omitempty"`
+	Source     string    `json:"source,omitempty"`
+	ObservedAt time.Time `json:"observed_at,omitempty"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
+	// DNS freshness is diagnostic. ExpiresAt remains the routing lease checked
+	// below; an expired DNS answer can still be retained by the provider's LRU.
+	DNSExpiresAt  *time.Time  `json:"dns_expires_at,omitempty"`
+	DNSStale      bool        `json:"dns_stale,omitempty"`
+	RetentionMode string      `json:"retention_mode,omitempty"`
+	Conflict      bool        `json:"conflict"`
+	Candidates    []Candidate `json:"candidates,omitempty"`
+	Provider      string      `json:"-"`
 }
 
 func Validate(cfg Config) error {
