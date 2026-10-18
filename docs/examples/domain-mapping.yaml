@@ -5,6 +5,10 @@ domain-mapping:
   enable: true
   # 所有 provider 共享的查询预算，单位毫秒；省略或 0 时为 50。
   timeout: 50
+  # 每个 provider 的 HTTP 连接上限，包含拨号、活动和空闲连接。
+  max-connections: 16
+  # 当前运行时未完成的查询上限；等待连接和超时后仍在退出的工作也计数。
+  max-inflight: 128
   providers:
     - name: mosdns
       type: mosdns-http-v1

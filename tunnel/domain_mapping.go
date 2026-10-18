@@ -37,6 +37,10 @@ func lookupDomainMapping(ctx context.Context, metadata *C.Metadata) bool {
 			diagnostic.LookupStatus = "timeout"
 		} else if errors.Is(err, context.Canceled) {
 			diagnostic.LookupStatus = "canceled"
+		} else if errors.Is(err, domainmapping.ErrOverloaded) {
+			diagnostic.LookupStatus = "overloaded"
+		} else if errors.Is(err, domainmapping.ErrRetired) {
+			diagnostic.LookupStatus = "retired"
 		}
 		log.Debugln("[Domain Mapping] lookup %s -> %s failed: %s", metadata.SrcIP, metadata.DstIP, err)
 		return false

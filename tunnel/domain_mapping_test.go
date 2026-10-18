@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ import (
 	R "github.com/metacubex/mihomo/rules/common"
 )
 
-func enableMappingTest(t *testing.T, handler http.HandlerFunc) {
+func enableMappingTest(t *testing.T, handler http.HandlerFunc, configure ...func(*domainmapping.Config)) {
 	t.Helper()
 	old := resolver.DefaultHostMapper
 	resolver.DefaultHostMapper = nil // dns.enable=false
@@ -30,11 +31,77 @@ func enableMappingTest(t *testing.T, handler http.HandlerFunc) {
 	})
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	if err := UpdateDomainMapping(domainmapping.Config{
+	cfg := domainmapping.Config{
 		Enable: true, Timeout: 1000,
 		Providers: []domainmapping.ProviderConfig{{Name: "mosdns", Type: "mosdns-http-v1", Endpoint: server.URL}},
-	}); err != nil {
+	}
+	for _, edit := range configure {
+		edit(&cfg)
+	}
+	if err := UpdateDomainMapping(cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMappingOverloadAndRetirementPreserveFallbackTarget(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var requests atomic.Int32
+	enableMappingTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		mappingHitHandler(w, r)
+	}, func(cfg *domainmapping.Config) { cfg.MaxInflight = 1 })
+	var once sync.Once
+	releaseHandler := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(releaseHandler)
+	first := realMetadata()
+	done := make(chan bool, 1)
+	go func() { done <- lookupDomainMapping(context.Background(), first) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first lookup did not reach provider")
+	}
+	overloaded := realMetadata()
+	overloaded.SrcIP = overloaded.SrcIP.Next() // A distinct key cannot share the active lookup.
+	originalIP := overloaded.DstIP
+	if lookupDomainMapping(context.Background(), overloaded) {
+		t.Fatal("overloaded lookup reported a hit")
+	}
+	if overloaded.DomainResolution == nil || overloaded.DomainResolution.LookupStatus != "overloaded" || overloaded.DomainMappingHost != "" || overloaded.Host != "" || overloaded.DstIP != originalIP {
+		t.Fatalf("overload did not preserve fallback metadata: %+v", overloaded)
+	}
+	udp := realMetadata()
+	udp.NetWork, udp.SrcIP = C.UDP, overloaded.SrcIP.Next()
+	sender := &mappingSniffSender{}
+	if err := prepareUDPDomain(udp, sender); err != nil {
+		t.Fatal(err)
+	}
+	if !sender.sniffed || sender.skipped || udp.RuleHost() != "payload.example" || udp.DomainResolution.LookupStatus != "overloaded" || udp.Host != "" || udp.DstIP != originalIP {
+		t.Fatalf("overload did not continue payload fallback: %+v, %+v", udp, sender)
+	}
+	domainMapping.Current().Retire()
+	retired := realMetadata()
+	if lookupDomainMapping(context.Background(), retired) || retired.DomainResolution == nil || retired.DomainResolution.LookupStatus != "retired" || retired.DomainMappingHost != "" || retired.Host != "" || retired.DstIP != originalIP {
+		t.Fatalf("retired lookup did not preserve fallback metadata: %+v", retired)
+	}
+	releaseHandler()
+	select {
+	case hit := <-done:
+		if !hit || first.DomainMappingHost != "mapped.example" {
+			t.Fatalf("retirement canceled admitted lookup: %+v", first)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitted lookup did not finish")
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("rejected lookup reached provider: requests=%d", got)
 	}
 }
 

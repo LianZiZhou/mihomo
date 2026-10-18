@@ -14,6 +14,8 @@
 domain-mapping:
   enable: true
   timeout: 50
+  max-connections: 16
+  max-inflight: 128
   providers:
     - name: mosdns
       type: mosdns-http-v1
@@ -24,6 +26,8 @@ domain-mapping:
 | --- | --- |
 | `enable` | 默认 `false`。开启后至少配置一个 provider。 |
 | `timeout` | 整数毫秒；省略或填写 `0` 使用 **50 ms**。负值无效。多个 provider、HTTP 读写、JSON 解析和等待共享一次查询的总预算；预算到期后不接受命中。 |
+| `max-connections` | 每个 HTTP provider 的连接上限；省略或 `0` 使用 **16**。包括正在拨号、活动及空闲连接。负值无效。 |
+| `max-inflight` | 当前运行时全部未完成的共享查询上限；省略或 `0` 使用 **128**。等待连接以及超时后仍未退出的 provider 工作也计入。负值无效。 |
 | `providers` | 按配置顺序查询；第一个有效命中结束查询，未命中或失败时在剩余预算内继续后续 provider。 |
 | `name` | 必填且不能重名，用于连接诊断。 |
 | `type` | 当前支持 `mosdns-http-v1`。 |
@@ -42,7 +46,7 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 - **TCP**：每条新连接在内置真实 IP 映射和报文嗅探之前查询外部 provider。
 - **UDP**：每个新 NAT 会话在首次异步选路协程中查询，不阻塞公共收包入口；等待期间首包进入既有发送队列。命中会释放 QUIC 嗅探状态，保留待发送数据。
 - **命中**：写入仅供规则使用的 `DomainMappingHost`，跳过报文嗅探和内置 IP 到域名的替换，不修改 `Host` 或 `DstIP`，也不重新解析返回的域名。
-- **未命中、异常或超时**：继续已有的内置映射、嗅探及规则流程。UDP 保留其原有的嗅探与元数据预处理顺序。
+- **未命中、容量饱和、异常或超时**：继续已有的内置映射、嗅探及规则流程。UDP 保留其原有的嗅探与元数据预处理顺序。
 
 `Metadata.RuleHost()` 的优先级为 `DomainMappingHost → SniffHost → Host`。因此 DOMAIN、DOMAIN-SUFFIX 等域名规则可使用映射证据，拨号仍使用原目标 IP。此改动没有调整负载均衡按 `Host` 计算哈希等既有语义。
 
@@ -64,22 +68,34 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 }
 ```
 
-`lookupStatus` 可为 `hit`、`miss`、`error`、`timeout`、`canceled`。关闭桥接或因显式域名、fake-IP 而跳过查询时不新增诊断对象。`provider` 表示配置中的服务名，`source` 表示 DNS 证据类型；MosDNS 当前来源包括 `a`、`aaaa`、`https_hint`、`svcb_hint`。只有成功命中时，`scope`、`conflict` 和有效期才应用于规则证据；错误诊断可能保留服务返回的原字段。
+`lookupStatus` 可为 `hit`、`miss`、`error`、`timeout`、`canceled`、`overloaded`、`retired`。`overloaded` 表示当前运行时的共享查询容量已满，因此没有发起新的 provider 查询；`retired` 表示该调用获取的旧运行时已在重载期间退休，同样不再接纳新查询。关闭桥接或因显式域名、fake-IP 而跳过查询时不新增诊断对象。`provider` 表示配置中的服务名，`source` 表示 DNS 证据类型；MosDNS 当前来源包括 `a`、`aaaa`、`https_hint`、`svcb_hint`。只有成功命中时，`scope`、`conflict` 和有效期才应用于规则证据；错误诊断可能保留服务返回的原字段。
 
 相同客户端 IP 与目标 IP 的并发查询共享一个在途请求。单个调用方取消等待，不会取消其他调用方共享的查询。完成后的成功结果、未命中和错误均不缓存：共享 IP 的域名归属可能在旧记录 TTL 到期前发生变化。HTTP 连接本身继续复用，不执行应用层重试。
 
 共享请求使用固定截止时间，后加入者只等待剩余预算；已过期但尚未退出的 provider 不会让新请求继承旧超时。等待方独立执行超时回退，provider 在截止时间之后返回的结果不会应用到分流。
+
+### 资源与延迟边界
+
+默认最多接纳 128 个尚未结束的共享查询，所有 provider 共用这个运行时额度。等待 HTTP 连接的查询已经占用额度，容量满后新的不同查询立即以 `overloaded` 回退，没有另外增长的等待队列。已有相同客户端/IP 且尚未到期的查询仍可加入共享。查询超时之后，如果 provider 尚未退出，额度继续保留到它实际结束；反复请求不能绕过上限积累后台工作。
+
+每个 provider 使用独立连接池，默认最多 16 条连接，空闲池也使用相同上限。普通本机 HTTP 使用 HTTP/1.1 长连接；HTTPS 保留正常证书验证及 HTTP/2 协商，HTTP/2 可在同一连接上承载多个查询，因此连接数和在途查询数是不同的限制。未复用连接时才增加建连成本，复用时仍需一次 HTTP 请求往返。多个 provider 的连接上限分别计算。
+
+等待连接、TCP 建立及 TLS 握手沿用最初查询的绝对截止时间；不会在排到连接或进入握手时重新获得完整预算。实现将查询的截止时间及取消信号恢复到 Transport 的拨号上下文，避免请求已超时但后台仍沿用默认 30 秒拨号时间。默认 50 毫秒是本桥接等待预算，不是整个业务建连的硬实时上限：调度和 GC 可能带来额外延迟，回退后的原有嗅探与出站拨号也另有成本。
+
+MosDNS 的 `domain_mapping.args.api` 可配置 `max_concurrent`（默认 128）及 `timeout`（默认 1000 毫秒）；lookup 和 stats 共用服务端额度，超额请求和查询超时尝试返回 HTTP 503，应答写入也受服务端的绝对截止时间约束。若截止时间已到或 headers 已经发出，客户端可能只收到连接关闭或不完整应答，不能保证 503 送达。非 200 响应或不完整响应按 provider 错误处理，可在剩余预算内继续下一个 provider；服务端 `/v1/stats` 的 `api_rejected` 和 `api_timeouts` 可辅助区分服务端容量与超时。服务端额度统计 handler 执行，不是整个 HTTP 服务器的 socket 上限。降低上限会减少资源占用，也可能降低突发时的映射成功率，需结合目标设备的 CPU、内存及 DNS 应答延迟调节。
 
 ## HTTP API v1
 
 请求：
 
 ```http
-GET /plugins/domain_index/v1/lookup?ip=203.0.113.20&client=192.168.1.8
+GET /plugins/domain_index/v1/lookup?ip=203.0.113.20&client=192.168.1.8&view=route
 Accept: application/json
 ```
 
 `ip` 是目标 IPv4/IPv6；`client` 是入站源 IP，不包含端口。源 IP 不可用时省略 `client`，由 MosDNS 查询全局索引。IPv4 映射 IPv6 地址先转换成普通 IPv4；IPv6 参数由 HTTP 客户端自动进行 URL 编码。
+
+Mihomo 始终设置 `view=route`，请求仅包含选中域名证据的精简 JSON。此视图与默认完整视图的区别只有省略 `candidates`，hit 和 miss 都不发送候选字段。旧 MosDNS 忽略 `view` 参数并返回完整 v1 响应时仍然兼容，不增加能力探测请求。人工诊断可省略 `view` 或设置 `view=full`。
 
 命中示例（时间仅演示格式，实时应答必须填写实际尚未过期的时间）：
 
@@ -93,15 +109,7 @@ Accept: application/json
   "source": "a",
   "observed_at": "2026-10-18T12:00:00+08:00",
   "expires_at": "2026-10-18T12:05:00+08:00",
-  "conflict": false,
-  "candidates": [
-    {
-      "domain": "service.example",
-      "source": "a",
-      "observed_at": "2026-10-18T12:00:00+08:00",
-      "expires_at": "2026-10-18T12:05:00+08:00"
-    }
-  ]
+  "conflict": false
 }
 ```
 
@@ -113,8 +121,7 @@ Accept: application/json
   "status": "miss",
   "ip": "203.0.113.20",
   "scope": "global",
-  "conflict": false,
-  "candidates": []
+  "conflict": false
 }
 ```
 
@@ -122,7 +129,7 @@ Accept: application/json
 
 MosDNS 优先客户端索引，再回退全局索引。多个有效候选存在时，服务端选择最近观察的域名并设置 `conflict=true`；Mihomo 使用服务返回的选中域名，诊断字段保留冲突信息。这是兼容既定分流行为的选择，不能消除共享 IP 的歧义。
 
-MosDNS 的 `candidates` 最多列出最近 32 个不同域名，仅供诊断，不代表索引的完整内容。Mihomo HTTP provider 校验整份 JSON 的语法，但不解码和复制候选列表；分流使用顶层选中域名、有效期及冲突标记。旧服务返回的较大候选列表仍受 1 MiB 响应上限约束。
+MosDNS 完整视图中的 `candidates` 最多列出最近 32 个不同域名，仅供诊断，不代表索引的完整内容。收到完整响应时，Mihomo HTTP provider 校验整份 JSON 的语法，但不解码和复制候选列表；分流使用顶层选中域名、有效期及冲突标记。更早服务返回的较大候选列表仍受 1 MiB 响应上限约束。精简查询直接使用 MosDNS 维护的最新记录及不同域名计数，不需要先构造完整诊断列表再丢弃。
 
 ## 开发扩展与热重载
 
@@ -137,9 +144,9 @@ type Provider interface {
 
 这是编译期扩展，不加载动态 `.so` 插件。增加 provider 类型时，实现接口，并同时扩展 `Validate` 的配置校验和 `New` 中的 provider 构造分派。`Lookup` 必须遵守 `ctx`，返回合法且有效的域名证据，不改写连接目的地址；设置 `Result.Provider` 供诊断使用。自定义实现应提供与 HTTP v1 相当的证据校验，运行时不会替其验证任意结果。
 
-运行时可以停止等待并拒绝过期结果，但无法强制终止 Go goroutine。扩展 provider 必须限制自身工作量、响应取消并释放资源，不能依靠等待方超时回收其内部任务。
+运行时可以停止等待并拒绝过期结果，但无法强制终止 Go goroutine。扩展 provider 必须限制自身工作量、响应取消并释放资源，不能依靠等待方超时回收其内部任务。`max-inflight` 限制 Runtime 发起的工作数量，不限制 provider 自行创建的额外 goroutine、连接或内存。
 
-`Runtime` 负责查询总预算和并发合并，`Manager` 使用原子指针替换运行时，独立于 `resolver.DefaultHostMapper`。配置解析先校验配置；应用配置时切换到新运行时。已有在途请求仍由旧运行时完成，不因重载中止；旧运行时退休时关闭空闲 HTTP 连接，并在请求完成后再次回收连接。关闭 `enable` 后新连接不再查询，已建立 TCP/UDP 会话保持既有路由。
+`Runtime` 负责查询总预算、容量限制和并发合并，`Manager` 使用原子指针替换运行时，独立于 `resolver.DefaultHostMapper`。配置解析先校验配置；应用配置时切换到新运行时。已有在途请求仍由旧运行时完成，不因重载中止；旧运行时拒绝新查询，关闭空闲 HTTP 连接，并在请求完成后再次回收连接。上限按运行时及 provider 计算，重载期间新旧运行时的资源可以暂时并存，并非整个进程永远只有一份连接上限。关闭 `enable` 后新连接不再查询，已建立 TCP/UDP 会话保持既有路由。
 
 新增 UDP 多包嗅探包装器若保留嗅探状态，可实现可选 `SkipSniff()` 方法：只清理嗅探缓冲和等待状态，不关闭底层 `PacketSender`，也不丢弃排队数据。现有 QUIC 包装器已经实现该方法。
 
@@ -158,7 +165,11 @@ go test ./component/domainmapping ./constant ./component/sniffer ./tunnel ./conf
 go vet ./component/domainmapping ./constant ./component/sniffer ./tunnel ./config ./hub/executor
 ```
 
-测试覆盖协议验证、过期、超时恢复、HTTP 连接复用、无正负结果缓存、并发合并与独立取消、客户端隔离、多 provider 顺序、重载、独立于 DNS 的配置、规则域名和目的 IP 保持、fake-IP/显式域名兼容、TCP 跳过嗅探、UDP 入口非阻塞和排队数据保留。
+测试覆盖协议验证、过期、超时恢复、HTTP 连接复用、无正负结果缓存、并发合并与独立取消、客户端隔离、多 provider 顺序、重载、独立于 DNS 的配置、规则域名和目的 IP 保持、fake-IP/显式域名兼容、TCP 跳过嗅探、UDP 入口非阻塞和排队数据保留。资源限制的验收包括连接队列使用原预算、饱和后既有共享仍可加入、迟到 provider 继续占用额度直到退出、TCP/TLS 取消回收及 HTTPS HTTP/2 兼容；跨进程脚本还覆盖新 Mihomo 与忽略 `view` 的旧 API 兼容。
+
+性能验收应同时观察映射查询延迟、DNS 应答延迟和资源峰值，覆盖大索引桶、批量过期、突发新目标及不可用 provider。容量限制与精简 JSON 不构成目标设备 p99 延迟的保证；ARM/MIPS 设备仍需实测。
+
+本轮精简查询与资源限制已通过两仓库的 `go test ./...` 及相关包 `go vet`。Windows 直接可信 ECS 与 WSL Linux amd64 的真实 dnsmasq 2.92 跨进程链路各通过 1000/1000 条 TCP 连接、100/100 个 UDP 会话，覆盖 route/full 一致性、过期回退、重载及旧 API 兼容；Linux 链路同时通过 ECS 策略与缓存隔离、TCP DNS、UDP 截断、相关 HTTPS Additional 及 provider 不可用后的原嗅探回退。Linux arm64 和 mipsle softfloat 的两个内核均交叉编译成功，尚未在目标设备运行。MosDNS 的实际阻塞写入测试覆盖完整响应 handler、精简响应的最后 flush 及 keepalive 后续响应。这些检查不替代 OpenWRT 实机性能与透明代理验收。
 
 有受支持的 C 编译器及 CGO 环境时，可额外运行：
 

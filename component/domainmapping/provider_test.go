@@ -41,7 +41,7 @@ func TestHTTPContractAndNoResultCache(t *testing.T) {
 	var count atomic.Int32
 	var connections atomic.Int32
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/plugins/index/v1/lookup" || r.URL.Query().Get("ip") != testDestination.String() || r.URL.Query().Get("client") != testClient.String() {
+		if r.Method != http.MethodGet || r.URL.Path != "/plugins/index/v1/lookup" || r.URL.Query().Get("ip") != testDestination.String() || r.URL.Query().Get("client") != testClient.String() || r.URL.Query().Get("view") != "route" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 		}
 		result := hitResult("FIRST.Example.")
@@ -298,9 +298,15 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	if runtime.timeout != 50*time.Millisecond {
 		t.Fatalf("unexpected default timeout %s", runtime.timeout)
 	}
+	provider := runtime.providers[0].(*httpProvider)
+	if runtime.maxInflight != DefaultMaxInflight || provider.transport.MaxConnsPerHost != DefaultMaxConnections {
+		t.Fatalf("unexpected default limits: inflight=%d connections=%d", runtime.maxInflight, provider.transport.MaxConnsPerHost)
+	}
 	for _, edit := range []func(*Config){
 		func(c *Config) { c.Providers = nil },
 		func(c *Config) { c.Timeout = -1 },
+		func(c *Config) { c.MaxConnections = -1 },
+		func(c *Config) { c.MaxInflight = -1 },
 		func(c *Config) { c.Providers[0].Name = "" },
 		func(c *Config) { c.Providers[0].Type = "unknown" },
 		func(c *Config) { c.Providers[0].Endpoint = "file:///tmp/index" },

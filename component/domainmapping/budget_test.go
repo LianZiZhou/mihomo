@@ -59,7 +59,7 @@ func TestBudgetBoundsUncooperativeProviderAndReplacesExpiredFlight(t *testing.T)
 	releaseNew := func() { newOnce.Do(func() { close(p.release[1]) }) }
 	defer releaseOld()
 	defer releaseNew()
-	runtime := &Runtime{providers: []Provider{p}, timeout: 500 * time.Millisecond, flights: make(map[lookupKey]*flight)}
+	runtime := &Runtime{providers: []Provider{p}, timeout: 500 * time.Millisecond, maxInflight: 2, flights: make(map[lookupKey]*flight)}
 	key := lookupKey{client: testClient, destination: testDestination}
 	first := make(chan error, 1)
 	go func() {
@@ -132,7 +132,7 @@ func TestHTTPRejectsCompleteResponseWhenBudgetExpiresAtEOF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := newHTTPProvider(testConfig("http://127.0.0.1/lookup").Providers[0])
+	p := newHTTPProvider(testConfig("http://127.0.0.1/lookup").Providers[0], DefaultTimeout, DefaultMaxConnections)
 	defer p.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()

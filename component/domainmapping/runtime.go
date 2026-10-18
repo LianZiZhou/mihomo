@@ -14,6 +14,11 @@ type lookupKey struct {
 	destination netip.Addr
 }
 
+var (
+	ErrOverloaded = errors.New("domain-mapping maximum in-flight lookups reached")
+	ErrRetired    = errors.New("domain-mapping runtime has been retired")
+)
+
 type flight struct {
 	done     chan struct{}
 	deadline time.Time
@@ -25,11 +30,13 @@ type flight struct {
 // and failures, are never cached: a DNS answer may change an IP's ownership
 // while the previous answer's TTL is still valid.
 type Runtime struct {
-	providers []Provider
-	timeout   time.Duration
-	mu        sync.Mutex
-	flights   map[lookupKey]*flight
-	retired   atomic.Bool
+	providers   []Provider
+	timeout     time.Duration
+	maxInflight int
+	active      int
+	mu          sync.Mutex
+	flights     map[lookupKey]*flight
+	retired     atomic.Bool
 }
 
 func New(cfg Config) (*Runtime, error) {
@@ -40,14 +47,22 @@ func New(cfg Config) (*Runtime, error) {
 		return nil, nil
 	}
 	runtime := &Runtime{
-		timeout: time.Duration(cfg.Timeout) * time.Millisecond,
-		flights: make(map[lookupKey]*flight),
+		timeout:     time.Duration(cfg.Timeout) * time.Millisecond,
+		flights:     make(map[lookupKey]*flight),
+		maxInflight: cfg.MaxInflight,
 	}
 	if runtime.timeout == 0 {
 		runtime.timeout = DefaultTimeout
 	}
+	if runtime.maxInflight == 0 {
+		runtime.maxInflight = DefaultMaxInflight
+	}
+	maxConnections := cfg.MaxConnections
+	if maxConnections == 0 {
+		maxConnections = DefaultMaxConnections
+	}
 	for _, cfg := range cfg.Providers {
-		runtime.providers = append(runtime.providers, newHTTPProvider(cfg))
+		runtime.providers = append(runtime.providers, newHTTPProvider(cfg, runtime.timeout, maxConnections))
 	}
 	return runtime, nil
 }
@@ -65,12 +80,23 @@ func (r *Runtime) Lookup(ctx context.Context, clientIP, destinationIP netip.Addr
 	deadline := time.Now().Add(r.timeout)
 	key := lookupKey{client: clientIP.Unmap(), destination: destinationIP.Unmap()}
 	r.mu.Lock()
+	if r.retired.Load() {
+		r.mu.Unlock()
+		return Result{Status: "retired"}, ErrRetired
+	}
 	f, exists := r.flights[key]
 	if !exists || !time.Now().Before(f.deadline) {
+		if r.active >= r.maxInflight {
+			r.mu.Unlock()
+			return Result{Status: "overloaded"}, ErrOverloaded
+		}
 		// A provider that is still finishing after its deadline must not make
-		// a later request inherit an already expired flight.
+		// a later request inherit an already expired flight. It continues to
+		// consume capacity until it returns, even after a successor replaces
+		// its map entry, so uncooperative providers cannot grow without bound.
 		f = &flight{done: make(chan struct{}), deadline: deadline}
 		r.flights[key] = f
+		r.active++
 		go r.lookup(key, f)
 	}
 	r.mu.Unlock()
@@ -124,6 +150,7 @@ func (r *Runtime) lookup(key lookupKey, f *flight) {
 		}
 	}
 	r.mu.Lock()
+	r.active--
 	if r.flights[key] == f {
 		delete(r.flights, key)
 	}
@@ -134,11 +161,13 @@ func (r *Runtime) lookup(key lookupKey, f *flight) {
 	}
 }
 
-// Retire releases idle HTTP connections without canceling lookups that already
-// hold this runtime. Their connections are released again when they finish.
+// Retire stops admitting new lookups and releases idle HTTP connections without
+// canceling existing lookups. Their connections are released again at completion.
 func (r *Runtime) Retire() {
 	if r != nil {
+		r.mu.Lock()
 		r.retired.Store(true)
+		r.mu.Unlock()
 		r.closeIdleConnections()
 	}
 }
