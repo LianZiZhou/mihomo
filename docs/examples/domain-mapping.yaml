@@ -1,0 +1,16 @@
+# 合并到现有 Mihomo 配置；入站、代理和规则沿用你的部署。
+# 要求 MosDNS 已加载 domain_mapping 插件，且 tag 为 domain_index。
+# MosDNS API 仅监听可信本机地址，例如 127.0.0.1:9091。
+domain-mapping:
+  enable: true
+  # 所有 provider 共享的查询预算，单位毫秒；省略或 0 时为 50。
+  timeout: 50
+  providers:
+    - name: mosdns
+      type: mosdns-http-v1
+      endpoint: http://127.0.0.1:9091/plugins/domain_index/v1/lookup
+
+# domain-mapping 独立于 dns.enable 与 sniffer.enable。
+# 使用 MosDNS 解析时可保持 Mihomo dns.enable: false。
+# 开启已有 sniffer 可作为外部映射未命中、超时或异常时的回退。
+# 域名规则正常使用 DOMAIN / DOMAIN-SUFFIX / RULE-SET；无需改写拨号目标。

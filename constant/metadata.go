@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"time"
 )
 
 // SOCKS address types as defined in RFC 1928 section 5.
@@ -217,6 +218,19 @@ type Metadata struct {
 	RawDstAddr net.Addr `json:"-"`
 	// Only domain rule
 	SniffHost string `json:"sniffHost"`
+	// DomainMappingHost is DNS evidence for rules only. It must never replace
+	// Host or DstIP: the client has already chosen the dial destination.
+	DomainMappingHost string            `json:"domainMappingHost,omitempty"`
+	DomainResolution  *DomainResolution `json:"domainResolution,omitempty"`
+}
+
+type DomainResolution struct {
+	Provider     string    `json:"provider,omitempty"`
+	Source       string    `json:"source,omitempty"`
+	LookupStatus string    `json:"lookupStatus"`
+	Scope        string    `json:"scope,omitempty"`
+	Conflict     bool      `json:"conflict"`
+	ExpiresAt    time.Time `json:"expiresAt,omitempty"`
 }
 
 func (m *Metadata) RemoteAddress() string {
@@ -268,11 +282,13 @@ func (m *Metadata) Resolved() bool {
 }
 
 func (m *Metadata) RuleHost() string {
-	if len(m.SniffHost) == 0 {
-		return m.Host
-	} else {
+	if m.DomainMappingHost != "" {
+		return m.DomainMappingHost
+	}
+	if m.SniffHost != "" {
 		return m.SniffHost
 	}
+	return m.Host
 }
 
 // Pure is used to solve unexpected behavior

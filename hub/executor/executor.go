@@ -100,6 +100,10 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
 	updateSniffer(cfg.Sniffer)
+	if err := tunnel.UpdateDomainMapping(cfg.DomainMapping); err != nil {
+		// Config parsing validates this before any reload side effects.
+		log.Errorln("[Domain Mapping] %s", err)
+	}
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
 	updateDNS(cfg.DNS, cfg.General.IPv6)

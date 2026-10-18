@@ -21,6 +21,7 @@ import (
 	"github.com/metacubex/mihomo/component/age"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/cidr"
+	"github.com/metacubex/mihomo/component/domainmapping"
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/process"
@@ -210,6 +211,7 @@ type Config struct {
 	RuleProviders map[string]P.RuleProvider
 	Tunnels       []LC.Tunnel
 	Sniffer       *sniffer.Config
+	DomainMapping domainmapping.Config
 	TLS           *TLS
 }
 
@@ -465,6 +467,7 @@ type RawConfig struct {
 	Profile       RawProfile                `yaml:"profile" json:"profile"`
 	GeoXUrl       RawGeoXUrl                `yaml:"geox-url" json:"geox-url"`
 	Sniffer       RawSniffer                `yaml:"sniffer" json:"sniffer"`
+	DomainMapping domainmapping.Config      `yaml:"domain-mapping" json:"domain-mapping"`
 	TLS           RawTLS                    `yaml:"tls" json:"tls"`
 
 	ClashForAndroid RawClashForAndroid `yaml:"clash-for-android" json:"clash-for-android"`
@@ -747,6 +750,10 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err = domainmapping.Validate(rawCfg.DomainMapping); err != nil {
+		return nil, err
+	}
+	config.DomainMapping = rawCfg.DomainMapping
 
 	elapsedTime := time.Since(startTime) / time.Millisecond                     // duration in ms
 	log.Infoln("Initial configuration complete, total time: %dms", elapsedTime) //Segment finished in xxm

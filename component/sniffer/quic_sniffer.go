@@ -158,7 +158,8 @@ type quicPacketSender struct {
 
 	done chan struct{}
 
-	closed bool
+	closed  bool
+	skipped bool
 }
 
 // Send will send PacketAdapter nonblocking
@@ -185,7 +186,7 @@ func (q *quicPacketSender) DoSniff(metadata *constant.Metadata) error {
 	select {
 	case <-q.done:
 		q.lock.RLock()
-		if r := q.result; r != "" {
+		if r := q.result; r != "" && !q.skipped {
 			q.replaceDomain(metadata, r)
 		}
 		q.lock.RUnlock()
@@ -199,6 +200,17 @@ func (q *quicPacketSender) DoSniff(metadata *constant.Metadata) error {
 // Close stop the Process loop
 func (q *quicPacketSender) Close() {
 	q.PacketSender.Close()
+	q.close()
+}
+
+// SkipSniff discards sniffing state without closing the packet sender or
+// dropping its queued datagrams. External DNS evidence already chose the rule
+// domain, so a completed or concurrent QUIC sniff must not replace it.
+func (q *quicPacketSender) SkipSniff() {
+	q.lock.Lock()
+	q.skipped = true
+	q.result = ""
+	q.lock.Unlock()
 	q.close()
 }
 

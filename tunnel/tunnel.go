@@ -287,6 +287,9 @@ func needLookupIP(metadata *C.Metadata) bool {
 }
 
 func preHandleMetadata(metadata *C.Metadata) error {
+	if metadata.DomainMappingHost != "" {
+		return nil // external DNS evidence affects rules, never the dial address
+	}
 	// preprocess enhanced-mode metadata
 	if needLookupIP(metadata) {
 		host, exist := resolver.FindHostByIP(metadata.DstIP)
@@ -450,12 +453,10 @@ func handleUDPConn(packet C.PacketAdapter) {
 			originMetadata := metadata  // save origin metadata
 			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
 
-			if err := sender.DoSniff(metadata); err != nil {
-				log.Warnln("[UDP] DoSniff error: %s", err.Error())
+			if err := prepareUDPDomain(metadata, sender); err != nil {
+				log.Warnln("[UDP] Prepare domain error: %s", err.Error())
 				return nil, nil, err
 			}
-
-			_ = preHandleMetadata(metadata) // error was pre-checked
 
 			proxy, rule, err := resolveMetadata(metadata)
 			if err != nil {
@@ -516,6 +517,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
+	mappingHit := lookupDomainMapping(context.Background(), metadata)
 	preHandleFailed := false
 	if err := preHandleMetadata(metadata); err != nil {
 		log.Debugln("[Metadata PreHandle] error: %s", err)
@@ -524,7 +526,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
-	if sniffingEnable && snifferDispatcher.Enable() {
+	if !mappingHit && sniffingEnable && snifferDispatcher.Enable() {
 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
 		if snifferDispatcher.TCPSniff(conn, metadata) {
