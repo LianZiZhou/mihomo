@@ -54,6 +54,33 @@ func (gs *GEOSITE) GetDomainMatcher() (router.DomainMatcher, error) {
 	return matcher, nil
 }
 
+// Snapshot pins the immutable domain matcher for a complete routing decision.
+// Clearing the global geodata cache only affects subsequently created snapshots.
+// A load failure is returned to the caller instead of being treated as a miss.
+func (gs *GEOSITE) Snapshot() (C.Rule, error) {
+	matcher, err := gs.GetDomainMatcher()
+	if err != nil {
+		return nil, err
+	}
+	return &geositeSnapshot{GEOSITE: gs, matcher: matcher}, nil
+}
+
+type geositeSnapshot struct {
+	*GEOSITE
+	matcher router.DomainMatcher
+}
+
+func (gs *geositeSnapshot) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
+	return gs.MatchDomain(metadata.RuleHost()), gs.adapter
+}
+
+func (gs *geositeSnapshot) MatchDomain(domain string) bool {
+	return domain != "" && gs.matcher.ApplyDomain(domain)
+}
+
+func (gs *geositeSnapshot) GetDomainMatcher() (router.DomainMatcher, error) { return gs.matcher, nil }
+func (gs *geositeSnapshot) GetRecodeSize() int                              { return gs.matcher.Count() }
+
 func (gs *GEOSITE) GetRecodeSize() int {
 	if matcher, err := gs.GetDomainMatcher(); err == nil {
 		return matcher.Count()

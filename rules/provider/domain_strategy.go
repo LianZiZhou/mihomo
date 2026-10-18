@@ -14,6 +14,8 @@ import (
 )
 
 type domainStrategy struct {
+	policyReady      bool
+	policyInvalid    bool
 	count            int
 	domainSetBuilder trie.DomainSetBuilder
 	domainSet        *trie.DomainSet
@@ -32,6 +34,7 @@ func (d *domainStrategy) Count() int {
 }
 
 func (d *domainStrategy) Reset() {
+	d.policyReady, d.policyInvalid = false, false
 	d.domainSetBuilder.Reset()
 	d.domainSet = nil
 	d.count = 0
@@ -39,11 +42,13 @@ func (d *domainStrategy) Reset() {
 
 func (d *domainStrategy) Insert(rule string) {
 	if strings.ContainsRune(rule, '/') {
+		d.policyInvalid = true
 		log.Warnln("skip invalid domain from rule provider: invalid domain %q: slash is not allowed", rule)
 		return
 	}
 	err := d.domainSetBuilder.Insert(rule)
 	if err != nil {
+		d.policyInvalid = true
 		log.Warnln("skip invalid domain from rule provider: %s", err)
 	} else {
 		d.count++
@@ -52,6 +57,7 @@ func (d *domainStrategy) Insert(rule string) {
 
 func (d *domainStrategy) FinishInsert() {
 	d.domainSet = d.domainSetBuilder.Build()
+	d.policyReady = true
 }
 
 func (d *domainStrategy) FromMrs(r io.Reader, count int) error {
@@ -61,6 +67,7 @@ func (d *domainStrategy) FromMrs(r io.Reader, count int) error {
 	}
 	d.count = count
 	d.domainSet = domainSet
+	d.policyReady = true
 	return nil
 }
 
@@ -115,3 +122,6 @@ var _ mrsRuleStrategy = (*domainStrategy)(nil)
 func NewDomainStrategy() *domainStrategy {
 	return &domainStrategy{}
 }
+
+func (d *domainStrategy) PolicyComplete() bool { return d.policyReady && !d.policyInvalid }
+func (d *domainStrategy) invalidatePolicy()    { d.policyInvalid = true }

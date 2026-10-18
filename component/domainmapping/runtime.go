@@ -30,13 +30,15 @@ type flight struct {
 // and failures, are never cached: a DNS answer may change an IP's ownership
 // while the previous answer's TTL is still valid.
 type Runtime struct {
-	providers   []Provider
-	timeout     time.Duration
-	maxInflight int
-	active      int
-	mu          sync.Mutex
-	flights     map[lookupKey]*flight
-	retired     atomic.Bool
+	providers        []Provider
+	timeout          time.Duration
+	maxInflight      int
+	active           int
+	mu               sync.Mutex
+	flights          map[lookupKey]*flight
+	retired          atomic.Bool
+	conflictPolicy   string
+	conflictFallback string
 }
 
 func New(cfg Config) (*Runtime, error) {
@@ -47,9 +49,17 @@ func New(cfg Config) (*Runtime, error) {
 		return nil, nil
 	}
 	runtime := &Runtime{
-		timeout:     time.Duration(cfg.Timeout) * time.Millisecond,
-		flights:     make(map[lookupKey]*flight),
-		maxInflight: cfg.MaxInflight,
+		timeout:          time.Duration(cfg.Timeout) * time.Millisecond,
+		flights:          make(map[lookupKey]*flight),
+		maxInflight:      cfg.MaxInflight,
+		conflictPolicy:   cfg.ConflictPolicy,
+		conflictFallback: cfg.ConflictFallback,
+	}
+	if runtime.conflictPolicy == "" {
+		runtime.conflictPolicy = "proxy-preferred"
+	}
+	if runtime.conflictFallback == "" {
+		runtime.conflictFallback = "REJECT"
 	}
 	if runtime.timeout == 0 {
 		runtime.timeout = DefaultTimeout
@@ -121,6 +131,7 @@ func (r *Runtime) Lookup(ctx context.Context, clientIP, destinationIP netip.Addr
 		// each other's evidence after the flight has completed. The HTTP
 		// provider skips candidates; custom providers may still supply them.
 		result.Candidates = append([]Candidate(nil), result.Candidates...)
+		result.Domains = append([]string(nil), result.Domains...)
 		result.DNSExpiresAt = copyTimestamp(result.DNSExpiresAt)
 		for i := range result.Candidates {
 			result.Candidates[i].DNSExpiresAt = copyTimestamp(result.Candidates[i].DNSExpiresAt)
@@ -156,7 +167,7 @@ func (r *Runtime) lookup(key lookupKey, f *flight) {
 			f.err = budgetErr
 			break
 		}
-		if err == nil && result.Status == "hit" {
+		if err == nil && (result.Status == "hit" || result.Status == "ambiguous") {
 			f.result, f.err = result, nil
 			break
 		}
@@ -218,3 +229,7 @@ func (m *Manager) Apply(cfg Config) error {
 }
 
 func (m *Manager) Current() *Runtime { return m.current.Load() }
+
+func (r *Runtime) ConflictPolicy() (string, string) {
+	return r.conflictPolicy, r.conflictFallback
+}

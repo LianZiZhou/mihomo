@@ -18,7 +18,7 @@ func UpdateDomainMapping(cfg domainmapping.Config) error { return domainMapping.
 // inbound domains and every address in a fake-IP pool (including missing pool
 // entries) retain their existing behavior. A hit is never a dial destination.
 func lookupDomainMapping(ctx context.Context, metadata *C.Metadata) bool {
-	if metadata.DomainMappingHost != "" {
+	if metadata.DomainMappingHost != "" || metadata.DomainMappingHandled {
 		return true
 	}
 	runtime := domainMapping.Current()
@@ -30,6 +30,7 @@ func lookupDomainMapping(ctx context.Context, metadata *C.Metadata) bool {
 		Provider: result.Provider, Source: result.Source, LookupStatus: result.Status,
 		Scope: result.Scope, Conflict: result.Conflict, ExpiresAt: result.ExpiresAt,
 		DNSExpiresAt: result.DNSExpiresAt, DNSStale: result.DNSStale, RetentionMode: result.RetentionMode,
+		CandidateCount: result.Total, Complete: result.Complete, Generation: result.Generation, Reason: result.Reason,
 	}
 	metadata.DomainResolution = diagnostic
 	if err != nil {
@@ -46,10 +47,17 @@ func lookupDomainMapping(ctx context.Context, metadata *C.Metadata) bool {
 		log.Debugln("[Domain Mapping] lookup %s -> %s failed: %s", metadata.SrcIP, metadata.DstIP, err)
 		return false
 	}
+	if result.Status == "ambiguous" {
+		metadata.DomainMappingHandled = true
+		metadata.DomainMappingCandidates = result.Domains
+		metadata.DomainMappingPolicy, metadata.DomainMappingFallback = runtime.ConflictPolicy()
+		return true
+	}
 	if result.Status != "hit" {
 		return false
 	}
 	metadata.DomainMappingHost = result.Domain
+	metadata.DomainMappingHandled = true
 	return true
 }
 

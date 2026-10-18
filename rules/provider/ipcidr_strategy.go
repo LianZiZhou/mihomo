@@ -14,8 +14,10 @@ import (
 )
 
 type ipcidrStrategy struct {
-	count   int
-	cidrSet *cidr.IpCidrSet
+	policyReady   bool
+	policyInvalid bool
+	count         int
+	cidrSet       *cidr.IpCidrSet
 	//trie    *trie.IpCidrTrie
 }
 
@@ -36,6 +38,7 @@ func (i *ipcidrStrategy) Count() int {
 }
 
 func (i *ipcidrStrategy) Reset() {
+	i.policyReady, i.policyInvalid = false, false
 	// i.trie = trie.NewIpCidrTrie()
 	i.cidrSet = cidr.NewIpCidrSet()
 	i.count = 0
@@ -45,6 +48,7 @@ func (i *ipcidrStrategy) Insert(rule string) {
 	//err := i.trie.AddIpCidrForString(rule)
 	err := i.cidrSet.AddIpCidrForString(rule)
 	if err != nil {
+		i.policyInvalid = true
 		log.Warnln("invalid Ipcidr:[%s]", rule)
 	} else {
 		i.count++
@@ -53,6 +57,7 @@ func (i *ipcidrStrategy) Insert(rule string) {
 
 func (i *ipcidrStrategy) FinishInsert() {
 	i.cidrSet.Merge()
+	i.policyReady = true
 }
 
 func (i *ipcidrStrategy) FromMrs(r io.Reader, count int) error {
@@ -62,6 +67,7 @@ func (i *ipcidrStrategy) FromMrs(r io.Reader, count int) error {
 	}
 	i.count = count
 	i.cidrSet = cidrSet
+	i.policyReady = true
 	return nil
 }
 
@@ -87,3 +93,6 @@ func (i *ipcidrStrategy) ToIpCidr() *netipx.IPSet {
 func NewIPCidrStrategy() *ipcidrStrategy {
 	return &ipcidrStrategy{}
 }
+
+func (i *ipcidrStrategy) PolicyComplete() bool { return i.policyReady && !i.policyInvalid }
+func (i *ipcidrStrategy) invalidatePolicy()    { i.policyInvalid = true }

@@ -222,18 +222,30 @@ type Metadata struct {
 	// Host or DstIP: the client has already chosen the dial destination.
 	DomainMappingHost string            `json:"domainMappingHost,omitempty"`
 	DomainResolution  *DomainResolution `json:"domainResolution,omitempty"`
+	// Ambiguous candidates affect rule selection only, never the dial target.
+	DomainMappingCandidates []string `json:"-"`
+	DomainMappingHandled    bool     `json:"-"`
+	DomainMappingPolicy     string   `json:"-"`
+	DomainMappingFallback   string   `json:"-"`
 }
 
 type DomainResolution struct {
-	Provider      string     `json:"provider,omitempty"`
-	Source        string     `json:"source,omitempty"`
-	LookupStatus  string     `json:"lookupStatus"`
-	Scope         string     `json:"scope,omitempty"`
-	Conflict      bool       `json:"conflict"`
-	ExpiresAt     time.Time  `json:"expiresAt,omitempty"`
-	DNSExpiresAt  *time.Time `json:"dnsExpiresAt,omitempty"`
-	DNSStale      bool       `json:"dnsStale,omitempty"`
-	RetentionMode string     `json:"retentionMode,omitempty"`
+	Provider       string     `json:"provider,omitempty"`
+	Source         string     `json:"source,omitempty"`
+	LookupStatus   string     `json:"lookupStatus"`
+	Scope          string     `json:"scope,omitempty"`
+	Conflict       bool       `json:"conflict"`
+	ExpiresAt      time.Time  `json:"expiresAt,omitempty"`
+	DNSExpiresAt   *time.Time `json:"dnsExpiresAt,omitempty"`
+	DNSStale       bool       `json:"dnsStale,omitempty"`
+	RetentionMode  string     `json:"retentionMode,omitempty"`
+	CandidateCount int        `json:"candidateCount,omitempty"`
+	Complete       bool       `json:"complete,omitempty"`
+	Generation     uint64     `json:"generation,omitempty"`
+	Decision       string     `json:"decision,omitempty"`
+	Policy         string     `json:"policy,omitempty"`
+	PolicyDomain   string     `json:"policyDomain,omitempty"`
+	Reason         string     `json:"reason,omitempty"`
 }
 
 func (m *Metadata) RemoteAddress() string {

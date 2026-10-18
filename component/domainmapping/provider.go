@@ -30,11 +30,13 @@ const (
 )
 
 type Config struct {
-	Enable         bool             `yaml:"enable" json:"enable"`
-	Timeout        int              `yaml:"timeout" json:"timeout"`                 // milliseconds; zero uses DefaultTimeout
-	MaxConnections int              `yaml:"max-connections" json:"max-connections"` // per HTTP provider; zero uses DefaultMaxConnections
-	MaxInflight    int              `yaml:"max-inflight" json:"max-inflight"`       // runtime work, including timed-out work still finishing
-	Providers      []ProviderConfig `yaml:"providers" json:"providers"`
+	Enable           bool             `yaml:"enable" json:"enable"`
+	Timeout          int              `yaml:"timeout" json:"timeout"`                 // milliseconds; zero uses DefaultTimeout
+	MaxConnections   int              `yaml:"max-connections" json:"max-connections"` // per HTTP provider; zero uses DefaultMaxConnections
+	MaxInflight      int              `yaml:"max-inflight" json:"max-inflight"`       // runtime work, including timed-out work still finishing
+	ConflictPolicy   string           `yaml:"conflict-policy" json:"conflict-policy"`
+	ConflictFallback string           `yaml:"conflict-fallback" json:"conflict-fallback"`
+	Providers        []ProviderConfig `yaml:"providers" json:"providers"`
 }
 
 type ProviderConfig struct {
@@ -79,9 +81,17 @@ type Result struct {
 	Conflict      bool        `json:"conflict"`
 	Candidates    []Candidate `json:"candidates,omitempty"`
 	Provider      string      `json:"-"`
+	Domains       []string    `json:"domains,omitempty"`
+	Complete      bool        `json:"complete"`
+	Total         int         `json:"total"`
+	Generation    uint64      `json:"generation"`
+	Reason        string      `json:"reason,omitempty"`
 }
 
 func Validate(cfg Config) error {
+	if cfg.ConflictPolicy != "" && cfg.ConflictPolicy != "proxy-preferred" && cfg.ConflictPolicy != "rule-priority" {
+		return errors.New("domain-mapping conflict-policy must be proxy-preferred or rule-priority")
+	}
 	if cfg.Timeout < 0 || int64(cfg.Timeout) > int64((1<<63-1)/time.Millisecond) {
 		return errors.New("domain-mapping timeout must be a non-negative duration in milliseconds")
 	}
@@ -100,7 +110,7 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("duplicate domain-mapping provider name %q", provider.Name)
 		}
 		names[provider.Name] = struct{}{}
-		if provider.Type != "mosdns-http-v1" {
+		if provider.Type != "mosdns-http-v1" && provider.Type != "mosdns-http-v2" {
 			return fmt.Errorf("unsupported domain-mapping provider type %q", provider.Type)
 		}
 		endpoint, err := url.Parse(provider.Endpoint)
@@ -113,6 +123,7 @@ func Validate(cfg Config) error {
 
 type httpProvider struct {
 	name        string
+	version     int
 	endpoint    *url.URL
 	client      *http.Client
 	transport   *http.Transport
@@ -178,8 +189,12 @@ func newHTTPProvider(cfg ProviderConfig, timeout time.Duration, maxConnections i
 		}
 		return tlsConn, nil
 	}
+	version := 1
+	if cfg.Type == "mosdns-http-v2" {
+		version = 2
+	}
 	return &httpProvider{
-		name: cfg.Name, endpoint: endpoint, transport: transport,
+		name: cfg.Name, version: version, endpoint: endpoint, transport: transport,
 		h2Idle: h2Idle, connections: connections, connectGate: semaphore.NewWeighted(1),
 		client: &http.Client{
 			Transport: transport,
@@ -250,7 +265,11 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 	endpoint := *p.endpoint
 	query := endpoint.Query()
 	query.Set("ip", destinationIP.Unmap().String())
-	query.Set("view", "route")
+	if p.version == 2 {
+		query.Del("view")
+	} else {
+		query.Set("view", "route")
+	}
 	query.Del("client")
 	if clientIP.IsValid() {
 		query.Set("client", clientIP.Unmap().String())
@@ -309,12 +328,18 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 	if err := lookupContextError(ctx); err != nil {
 		return result, err
 	}
-	if result.Version != 1 {
+	if result.Version != p.version {
 		return result, fmt.Errorf("unsupported domain-mapping response version %d", result.Version)
 	}
 	ip, err := netip.ParseAddr(result.IP)
 	if err != nil || ip.Unmap() != destinationIP.Unmap() {
 		return result, errors.New("domain-mapping response IP does not match query")
+	}
+	if p.version == 2 {
+		if err := validateV2(&result, clientIP); err != nil {
+			return result, err
+		}
+		return result, lookupContextError(ctx)
 	}
 	switch result.Status {
 	case "miss":
@@ -334,6 +359,56 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 		return result, err
 	}
 	return result, nil
+}
+
+// V2 separates a unique host from ambiguous attribution. Truncated/unknown
+// ownership is usable only by the explicitly configured conflict fallback.
+func validateV2(result *Result, clientIP netip.Addr) error {
+	if result.Total < 0 || len(result.Domains) > 1024 || result.Total < len(result.Domains) {
+		return errors.New("invalid domain-mapping candidate counts")
+	}
+	if result.Status == "miss" {
+		if result.Domain != "" || len(result.Domains) != 0 || result.Total != 0 {
+			return errors.New("domain-mapping miss contains domain evidence")
+		}
+		return nil
+	}
+	if result.Scope != "client" && result.Scope != "global" {
+		return errors.New("invalid domain-mapping scope")
+	}
+	if result.Scope == "client" && !clientIP.IsValid() {
+		return errors.New("client-scoped evidence without a client query")
+	}
+	if result.ExpiresAt.IsZero() || !result.ExpiresAt.After(time.Now()) {
+		return errors.New("domain-mapping response is missing its expiry or has expired")
+	}
+	seen := make(map[string]struct{}, len(result.Domains))
+	for i, domain := range result.Domains {
+		domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+		if !validDomain(domain) {
+			return errors.New("invalid domain-mapping candidate domain")
+		}
+		if _, exists := seen[domain]; exists {
+			return errors.New("duplicate domain-mapping candidate")
+		}
+		seen[domain] = struct{}{}
+		result.Domains[i] = domain
+	}
+	switch result.Status {
+	case "hit":
+		result.Domain = strings.ToLower(strings.TrimSuffix(result.Domain, "."))
+		if !validDomain(result.Domain) || !result.Complete || result.Total != 1 || result.Conflict || (len(result.Domains) != 0 && (len(result.Domains) != 1 || result.Domains[0] != result.Domain)) {
+			return errors.New("invalid unique domain-mapping evidence")
+		}
+	case "ambiguous":
+		if result.Domain != "" || (result.Complete && (result.Total != len(result.Domains) || result.Total < 2)) {
+			return errors.New("invalid ambiguous domain-mapping evidence")
+		}
+		result.Conflict = true
+	default:
+		return fmt.Errorf("invalid domain-mapping response status %q", result.Status)
+	}
+	return nil
 }
 
 func validDomain(domain string) bool {

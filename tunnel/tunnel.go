@@ -249,11 +249,15 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 
 // Mode return current mode
 func Mode() TunnelMode {
+	configMux.RLock()
+	defer configMux.RUnlock()
 	return mode
 }
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
+	configMux.Lock()
+	defer configMux.Unlock()
 	mode = m
 }
 
@@ -287,7 +291,7 @@ func needLookupIP(metadata *C.Metadata) bool {
 }
 
 func preHandleMetadata(metadata *C.Metadata) error {
-	if metadata.DomainMappingHost != "" {
+	if metadata.DomainMappingHost != "" || metadata.DomainMappingHandled {
 		return nil // external DNS evidence affects rules, never the dial address
 	}
 	// preprocess enhanced-mode metadata
@@ -401,7 +405,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
-	switch mode {
+	switch Mode() {
 	case Direct:
 		proxy = proxies["DIRECT"]
 	case Global:
@@ -644,9 +648,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case mode == Global:
+	case Mode() == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case mode == Direct:
+	case Mode() == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
@@ -656,6 +660,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
 	configMux.RLock()
 	defer configMux.RUnlock()
+	if metadata.DomainMappingHandled && metadata.DomainResolution != nil && metadata.DomainResolution.LookupStatus == "ambiguous" {
+		return matchDomainCandidates(metadata, helper)
+	}
 
 	var rematchChain []string
 	for {

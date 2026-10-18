@@ -10,9 +10,11 @@ import (
 )
 
 type classicalStrategy struct {
-	rules []C.Rule
-	count int
-	parse common.ParseRuleFunc
+	policyReady   bool
+	policyInvalid bool
+	rules         []C.Rule
+	count         int
+	parse         common.ParseRuleFunc
 }
 
 func (c *classicalStrategy) Behavior() P.RuleBehavior {
@@ -34,6 +36,7 @@ func (c *classicalStrategy) Count() int {
 }
 
 func (c *classicalStrategy) Reset() {
+	c.policyReady, c.policyInvalid = false, false
 	c.rules = nil
 	c.count = 0
 }
@@ -41,6 +44,7 @@ func (c *classicalStrategy) Reset() {
 func (c *classicalStrategy) Insert(rule string) {
 	r, err := c.payloadToRule(rule)
 	if err != nil {
+		c.policyInvalid = true
 		log.Warnln("parse classical rule [%s] error: %s", rule, err.Error())
 	} else {
 		c.rules = append(c.rules, r)
@@ -57,7 +61,10 @@ func (c *classicalStrategy) payloadToRule(rule string) (C.Rule, error) {
 	return c.parse(tp, payload, target, params, nil)
 }
 
-func (c *classicalStrategy) FinishInsert() {}
+func (c *classicalStrategy) FinishInsert() { c.policyReady = true }
+
+func (c *classicalStrategy) PolicyComplete() bool { return c.policyReady && !c.policyInvalid }
+func (c *classicalStrategy) invalidatePolicy()    { c.policyInvalid = true }
 
 func NewClassicalStrategy(parse common.ParseRuleFunc) *classicalStrategy {
 	return &classicalStrategy{rules: []C.Rule{}, parse: parse}

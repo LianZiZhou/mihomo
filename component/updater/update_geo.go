@@ -159,8 +159,7 @@ func UpdateGeoSite() (err error) {
 		return fmt.Errorf("invalid GeoSite database file: %s", err)
 	}
 
-	defer geodata.ClearGeoSiteCache()
-	if err = vehicle.Write(data); err != nil {
+	if err = geodata.UpdateGeoSiteCache(func() error { return vehicle.Write(data) }); err != nil {
 		return fmt.Errorf("can't save GeoSite database file: %w", err)
 	}
 	return nil

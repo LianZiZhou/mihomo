@@ -21,16 +21,18 @@ type RematchOption struct {
 }
 
 func (l *Rematch) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	l.applyMetadata(metadata)
+	l.ApplyMetadata(metadata)
 	return NewConn(nopConn{}, l), nil
 }
 
 func (l *Rematch) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	l.applyMetadata(metadata)
+	l.ApplyMetadata(metadata)
 	return NewPacketConn(&nopPacketConn{}, l), nil
 }
 
-func (l *Rematch) applyMetadata(metadata *C.Metadata) {
+// ApplyMetadata is the pure metadata transition used by candidate rule
+// evaluation. It does not dial, allocate a connection or change shared state.
+func (l *Rematch) ApplyMetadata(metadata *C.Metadata) {
 	if l.targetRematchName != nil {
 		metadata.RematchName = *l.targetRematchName
 	}

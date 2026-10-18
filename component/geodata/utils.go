@@ -3,6 +3,8 @@ package geodata
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/common/singleflight"
 	"github.com/metacubex/mihomo/component/geodata/router"
@@ -65,6 +67,31 @@ func Verify(name string) error {
 
 var loadGeoSiteMatcherListSF = singleflight.Group[[]*router.Domain]{StoreResult: true}
 var loadGeoSiteMatcherSF = singleflight.Group[router.DomainMatcher]{StoreResult: true}
+var geoSiteCacheUpdateMu sync.Mutex
+var geoSiteCacheGeneration atomic.Uint64
+
+// GeoSiteCacheGeneration is even while the published database is stable and
+// odd while its file or matcher caches are being replaced. A multi-rule
+// snapshot is consistent only if its starting and ending generations are the
+// same even value.
+func GeoSiteCacheGeneration() uint64 { return geoSiteCacheGeneration.Load() }
+
+// UpdateGeoSiteCache surrounds a database replacement and both cache resets
+// with one generation change. update must not call ClearGeoSiteCache itself.
+func UpdateGeoSiteCache(update func() error) error {
+	geoSiteCacheUpdateMu.Lock()
+	defer geoSiteCacheUpdateMu.Unlock()
+	geoSiteCacheGeneration.Add(1)
+	defer func() {
+		loadGeoSiteMatcherListSF.Reset()
+		loadGeoSiteMatcherSF.Reset()
+		geoSiteCacheGeneration.Add(1)
+	}()
+	if update != nil {
+		return update()
+	}
+	return nil
+}
 
 func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
 	if countryCode == "" {
@@ -193,8 +220,7 @@ func LoadGeoIPMatcher(country string) (router.IPMatcher, error) {
 }
 
 func ClearGeoSiteCache() {
-	loadGeoSiteMatcherListSF.Reset()
-	loadGeoSiteMatcherSF.Reset()
+	_ = UpdateGeoSiteCache(nil)
 }
 
 func ClearGeoIPCache() {

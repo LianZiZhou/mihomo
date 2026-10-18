@@ -6,7 +6,46 @@
 
 长期维护入口为 [Mihomo fork 的 Meta](https://github.com/LianZiZhou/mihomo/tree/Meta) 与 [MosDNS fork 的 main](https://github.com/LianZiZhou/mosdns/tree/main)。`Meta` 是此 Mihomo fork 的默认分支。
 
-## 配置与部署
+## 客户端真实 IP 分配与共享候选（v2）
+
+新部署推荐 `mosdns-http-v2`，配合 MosDNS 的 `allocation.client_scope`。v1 保留原行为，以便独立升级和回滚。v2 不把共享地址的最新 DNS 域名当作唯一归属。
+
+```yaml
+domain-mapping:
+  enable: true
+  timeout: 50
+  max-connections: 16
+  max-inflight: 128
+  conflict-policy: proxy-preferred
+  conflict-fallback: REJECT
+  providers:
+    - name: mosdns
+      type: mosdns-http-v2
+      endpoint: http://127.0.0.1:9091/plugins/domain_index/v2/lookup
+```
+
+主机制是在 MosDNS 向客户端应答前，从该域名的真实候选中挑选地址。按客户端分别占用，已有分配稳定复用；只有获准共享的域名可复用其他域名的地址。筛选只作用于最终响应，不修改全量上游缓存。没有可用候选时保留原答案，并记录全部返回地址带来的共享。
+
+共享约束固定如下：未命中域名规则的域名之间允许共享；只有未命中路径确定走 DIRECT，显式 DIRECT 域名才可加入同一共享类。其他情况按域名隔离，包括默认出口为代理组时的显式 DIRECT 域名。相同代理组、组当前选中 DIRECT、分类尚未查到，都不是扩大共享的依据。仍正常执行连接的 IP、端口、进程等规则。
+
+Mihomo 提供 `POST /dns-policy/classify` 权威分类接口。它使用控制器 Bearer 认证，要求已设置控制器 secret，且仅接受实际 loopback 对端；不信任转发头。请求为 `{"version":1,"queries":[{"domain":"example.com","client":"192.168.6.180"}]}`，最多 64 项及 32 KiB。响应含 `version`、`epoch`、`valid_for_ms` 和同序 `results`，每项含 `domain`、`client`、`class`、`share_eligible`。分类为 `unmatched`、`direct`、`isolated` 或 `unknown`。未知连接端口、协议、进程的条件采用保守判断，不拿 DNS 查询的端口和协议代替应用连接属性。
+
+MosDNS 异步合批获取分类并本地缓存，未知或过期分类暂时独占；分类服务不可用不阻塞 DNS。配置及规则集变化会改变分类 epoch。已有客户端地址不会因规则更新而消失；曾经兼容的共享域名在规则变化后可能成为冲突，连接阶段仍按实际候选与当前规则处理。
+
+v2 lookup 使用 `GET /plugins/domain_index/v2/lookup?ip=...&client=...`，不发送 v1 的 `view` 参数。唯一结果为 `status:hit`、`complete:true`、`total:1` 及合法 `domain`；共享或历史不完整为 `status:ambiguous`，`domain` 必须为空，携带 `domains`、`total`、`complete`、`generation` 和可选 `reason`。已知结果仍需合法 scope 和未来 `expires_at`。候选最多接收 1024 个，响应上限仍为 1 MiB。不完整集合不能用于宣称策略一致。v1 的最多 32 项诊断列表不会用于 v2 路由。
+
+- 唯一域名按正常规则分流，保持实际目的 IP。
+- 完整共享候选逐一评估完整规则，策略一致时直接使用该策略，无需协议 sniff。
+- 策略冲突时才应用 `conflict-policy`。`proxy-preferred`（默认）保护候选实际命中的显式域名代理规则，显式拒绝优先；多个保护目标按完整规则路径排序。`rule-priority` 则直接选择配置顺序中最早的候选结果。二者都可能影响共享地址上的其他域名，这是兜底策略，不能视作准确识别。
+- 候选不完整、规则快照失败或评估预算耗尽时，先按原顺序检查能够证明不依赖未知域名的连接属性规则，例如前置 IP REJECT；遇到无法确定的域名条件后才使用 `conflict-fallback`（默认 REJECT）。可显式设置需要保护的策略组。该策略必须存在，不能使用 PASS、REMATCH 等非终止策略；UDP 还要求支持 UDP。错误配置会使该连接选路失败。
+
+共享结果不会填写虚假的 `domainMappingHost`，也不会因没有唯一域名就意外触发 sniff。诊断额外包含 `candidateCount`、`complete`、`generation`、`decision`（`consensus` 或 `fallback`）、`policy`、`policyDomain`（仅冲突决策的依据）和 `reason`。实际 TCP/UDP 目标 IP 保持不变；已有连接不重新分流。
+
+AND/OR/NOT 在单个候选内评估，SUB-RULE 按完整子规则路径排序。规则、provider 和 GEOSITE 使用冻结视图；每个候选先在私有元数据上完成 REMATCH 的纯转换，再比较最终策略，只有获选路径提交统计及元数据。未就绪或含无法解析条目的 provider 不能证明未命中，配置挂起期间也不签发共享分类。处理过程有 50 ms 检查预算、一百万步和递归限制，失败进入显式兜底；这不承诺硬实时上限，调度、GC、原生规则操作及正则超时检测仍可能有额外延迟。普通唯一查询不执行多候选评估，也不新增分类 RPC。
+
+DNS TTL 不证明客户端已经忘记地址。迁移需要导入已有观察并保守保护未完整导出的历史，不能通过重启清空占用来制造独占。DNSSEC、复杂服务绑定等无法安全筛选的答案保持原样；HTTP/2、HTTP/3 的跨域连接复用也不能仅凭 DNS 对每个加密请求重新分流。
+
+## 配置与部署（v1 兼容模式）
 
 将以下配置合并进现有 Mihomo 配置；入站监听、代理和规则沿用自己的部署。可复制的片段见 [examples/domain-mapping.yaml](examples/domain-mapping.yaml)。
 
@@ -30,7 +69,7 @@ domain-mapping:
 | `max-inflight` | 当前运行时全部未完成的共享查询上限；省略或 `0` 使用 **128**。等待连接以及超时后仍未退出的 provider 工作也计入。负值无效。 |
 | `providers` | 按配置顺序查询；第一个有效命中结束查询，未命中或失败时在剩余预算内继续后续 provider。 |
 | `name` | 必填且不能重名，用于连接诊断。 |
-| `type` | 当前支持 `mosdns-http-v1`。 |
+| `type` | 支持 `mosdns-http-v1` 和 `mosdns-http-v2`，须与 endpoint 版本对应。 |
 | `endpoint` | 完整 HTTP(S) lookup URL；`domain_index` 必须与 MosDNS 插件 tag 一致。不能包含 URL 用户名、密码或 fragment。 |
 
 该功能独立于 `dns.enable` 和 `sniffer.enable`：关闭内置 DNS、关闭报文嗅探时仍可使用。若开启现有 sniffer，外部映射未命中时仍有原来的嗅探回退路径。
@@ -185,7 +224,7 @@ go vet ./component/domainmapping ./constant ./component/sniffer ./tunnel ./confi
 go test -race ./component/domainmapping ./component/sniffer ./tunnel
 ```
 
-当前 Windows 开发环境的 `CGO_ENABLED=0` 且没有 GCC，race 检查尚未完成。单元测试通过不代表真实 OpenWrt 的透明代理、dnsmasq 缓存、ECS 转发以及设备差异已经完成验收；这些需要单独做完整链路测试。
+Windows 开发环境的 `CGO_ENABLED=0` 且没有 GCC；本轮使用 WSL Linux 的 GCC 执行 race 检查。单元测试通过不代表真实 OpenWrt 的透明代理、dnsmasq 缓存、ECS 转发以及设备差异已经完成验收；这些需要单独做完整链路测试。
 
 ## 在 Meta 跟进上游
 
