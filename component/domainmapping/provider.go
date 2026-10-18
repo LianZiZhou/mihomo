@@ -33,6 +33,8 @@ type ProviderConfig struct {
 
 // Provider implementations must observe ctx and return evidence without
 // changing the destination address. Runtime owns timeouts and request sharing.
+// Runtime can stop waiting but cannot stop a provider's goroutine; providers
+// must also bound their own work and release resources after cancellation.
 type Provider interface {
 	Lookup(ctx context.Context, clientIP, destinationIP netip.Addr) (Result, error)
 	CloseIdleConnections()
@@ -114,6 +116,24 @@ func newHTTPProvider(cfg ProviderConfig) *httpProvider {
 
 func (p *httpProvider) CloseIdleConnections() { p.transport.CloseIdleConnections() }
 
+// lookupContextError also checks the absolute deadline: a CPU-heavy decode can
+// finish before the context timer goroutine gets scheduled to publish Err().
+func lookupContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// Candidate lists are diagnostic API data. Rules use only the selected domain,
+// so validate the JSON syntax without allocating or decoding every candidate.
+type ignoredCandidates struct{}
+
+func (*ignoredCandidates) UnmarshalJSON([]byte) error { return nil }
+
 func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip.Addr) (Result, error) {
 	result := Result{Provider: p.name}
 	endpoint := *p.endpoint
@@ -145,8 +165,21 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 	if len(body) > maxResponseSize {
 		return result, errors.New("domain-mapping response exceeds 1 MiB")
 	}
-	if err = json.Unmarshal(body, &result); err != nil {
+	if err := lookupContextError(ctx); err != nil {
+		return result, err
+	}
+	// Shadow only the wire candidates field; keep Result's public structure
+	// and JSON behavior unchanged for callers and custom provider extensions.
+	type resultJSON Result
+	wire := struct {
+		*resultJSON
+		Candidates ignoredCandidates `json:"candidates"`
+	}{resultJSON: (*resultJSON)(&result)}
+	if err = json.Unmarshal(body, &wire); err != nil {
 		return result, fmt.Errorf("invalid domain-mapping JSON: %w", err)
+	}
+	if err := lookupContextError(ctx); err != nil {
+		return result, err
 	}
 	if result.Version != 1 {
 		return result, fmt.Errorf("unsupported domain-mapping response version %d", result.Version)
@@ -168,6 +201,9 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 		}
 	default:
 		return result, fmt.Errorf("invalid domain-mapping response status %q", result.Status)
+	}
+	if err := lookupContextError(ctx); err != nil {
+		return result, err
 	}
 	return result, nil
 }

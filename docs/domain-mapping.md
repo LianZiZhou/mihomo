@@ -23,7 +23,7 @@ domain-mapping:
 | 字段 | 行为 |
 | --- | --- |
 | `enable` | 默认 `false`。开启后至少配置一个 provider。 |
-| `timeout` | 整数毫秒；省略或填写 `0` 使用 **50 ms**。负值无效。多个 provider 共享一次查询的总预算。 |
+| `timeout` | 整数毫秒；省略或填写 `0` 使用 **50 ms**。负值无效。多个 provider、HTTP 读写、JSON 解析和等待共享一次查询的总预算；预算到期后不接受命中。 |
 | `providers` | 按配置顺序查询；第一个有效命中结束查询，未命中或失败时在剩余预算内继续后续 provider。 |
 | `name` | 必填且不能重名，用于连接诊断。 |
 | `type` | 当前支持 `mosdns-http-v1`。 |
@@ -67,6 +67,8 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 `lookupStatus` 可为 `hit`、`miss`、`error`、`timeout`、`canceled`。关闭桥接或因显式域名、fake-IP 而跳过查询时不新增诊断对象。`provider` 表示配置中的服务名，`source` 表示 DNS 证据类型；MosDNS 当前来源包括 `a`、`aaaa`、`https_hint`、`svcb_hint`。只有成功命中时，`scope`、`conflict` 和有效期才应用于规则证据；错误诊断可能保留服务返回的原字段。
 
 相同客户端 IP 与目标 IP 的并发查询共享一个在途请求。单个调用方取消等待，不会取消其他调用方共享的查询。完成后的成功结果、未命中和错误均不缓存：共享 IP 的域名归属可能在旧记录 TTL 到期前发生变化。HTTP 连接本身继续复用，不执行应用层重试。
+
+共享请求使用固定截止时间，后加入者只等待剩余预算；已过期但尚未退出的 provider 不会让新请求继承旧超时。等待方独立执行超时回退，provider 在截止时间之后返回的结果不会应用到分流。
 
 ## HTTP API v1
 
@@ -120,6 +122,8 @@ Accept: application/json
 
 MosDNS 优先客户端索引，再回退全局索引。多个有效候选存在时，服务端选择最近观察的域名并设置 `conflict=true`；Mihomo 使用服务返回的选中域名，诊断字段保留冲突信息。这是兼容既定分流行为的选择，不能消除共享 IP 的歧义。
 
+MosDNS 的 `candidates` 最多列出最近 32 个不同域名，仅供诊断，不代表索引的完整内容。Mihomo HTTP provider 校验整份 JSON 的语法，但不解码和复制候选列表；分流使用顶层选中域名、有效期及冲突标记。旧服务返回的较大候选列表仍受 1 MiB 响应上限约束。
+
 ## 开发扩展与热重载
 
 实现位于 `component/domainmapping`，Go 扩展接口为：
@@ -132,6 +136,8 @@ type Provider interface {
 ```
 
 这是编译期扩展，不加载动态 `.so` 插件。增加 provider 类型时，实现接口，并同时扩展 `Validate` 的配置校验和 `New` 中的 provider 构造分派。`Lookup` 必须遵守 `ctx`，返回合法且有效的域名证据，不改写连接目的地址；设置 `Result.Provider` 供诊断使用。自定义实现应提供与 HTTP v1 相当的证据校验，运行时不会替其验证任意结果。
+
+运行时可以停止等待并拒绝过期结果，但无法强制终止 Go goroutine。扩展 provider 必须限制自身工作量、响应取消并释放资源，不能依靠等待方超时回收其内部任务。
 
 `Runtime` 负责查询总预算和并发合并，`Manager` 使用原子指针替换运行时，独立于 `resolver.DefaultHostMapper`。配置解析先校验配置；应用配置时切换到新运行时。已有在途请求仍由旧运行时完成，不因重载中止；旧运行时退休时关闭空闲 HTTP 连接，并在请求完成后再次回收连接。关闭 `enable` 后新连接不再查询，已建立 TCP/UDP 会话保持既有路由。
 
