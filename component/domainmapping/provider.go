@@ -86,6 +86,10 @@ type Result struct {
 	Total         int         `json:"total"`
 	Generation    uint64      `json:"generation"`
 	Reason        string      `json:"reason,omitempty"`
+	// V3 retains a latest-DNS hint in a small LRU independently of allocation
+	// recovery. Completeness describes recent conflict evidence, not identity.
+	CandidatesComplete   bool `json:"candidates_complete"`
+	AllocationRecovering bool `json:"allocation_recovering,omitempty"`
 }
 
 func Validate(cfg Config) error {
@@ -102,6 +106,7 @@ func Validate(cfg Config) error {
 		return errors.New("domain-mapping requires at least one provider when enabled")
 	}
 	names := make(map[string]struct{}, len(cfg.Providers))
+	native, legacy := false, false
 	for _, provider := range cfg.Providers {
 		if strings.TrimSpace(provider.Name) == "" {
 			return errors.New("domain-mapping provider name is required")
@@ -110,13 +115,21 @@ func Validate(cfg Config) error {
 			return fmt.Errorf("duplicate domain-mapping provider name %q", provider.Name)
 		}
 		names[provider.Name] = struct{}{}
-		if provider.Type != "mosdns-http-v1" && provider.Type != "mosdns-http-v2" {
+		if provider.Type != "mosdns-http-v1" && provider.Type != "mosdns-http-v2" && provider.Type != "mosdns-http-v3" {
 			return fmt.Errorf("unsupported domain-mapping provider type %q", provider.Type)
+		}
+		if provider.Type == "mosdns-http-v3" {
+			native = true
+		} else {
+			legacy = true
 		}
 		endpoint, err := url.Parse(provider.Endpoint)
 		if err != nil || endpoint == nil || endpoint.Hostname() == "" || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.User != nil || endpoint.Fragment != "" {
 			return fmt.Errorf("domain-mapping provider %q requires an HTTP(S) endpoint without userinfo or a fragment", provider.Name)
 		}
+	}
+	if native && (legacy || cfg.ConflictPolicy != "" || cfg.ConflictFallback != "") {
+		return errors.New("domain-mapping v3 cannot mix legacy providers or conflict-policy/conflict-fallback; ambiguity follows original rules")
 	}
 	return nil
 }
@@ -192,6 +205,8 @@ func newHTTPProvider(cfg ProviderConfig, timeout time.Duration, maxConnections i
 	version := 1
 	if cfg.Type == "mosdns-http-v2" {
 		version = 2
+	} else if cfg.Type == "mosdns-http-v3" {
+		version = 3
 	}
 	return &httpProvider{
 		name: cfg.Name, version: version, endpoint: endpoint, transport: transport,
@@ -265,7 +280,7 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 	endpoint := *p.endpoint
 	query := endpoint.Query()
 	query.Set("ip", destinationIP.Unmap().String())
-	if p.version == 2 {
+	if p.version >= 2 {
 		query.Del("view")
 	} else {
 		query.Set("view", "route")
@@ -334,6 +349,12 @@ func (p *httpProvider) Lookup(ctx context.Context, clientIP, destinationIP netip
 	ip, err := netip.ParseAddr(result.IP)
 	if err != nil || ip.Unmap() != destinationIP.Unmap() {
 		return result, errors.New("domain-mapping response IP does not match query")
+	}
+	if p.version == 3 {
+		if err := validateV3(&result, clientIP); err != nil {
+			return result, err
+		}
+		return result, lookupContextError(ctx)
 	}
 	if p.version == 2 {
 		if err := validateV2(&result, clientIP); err != nil {

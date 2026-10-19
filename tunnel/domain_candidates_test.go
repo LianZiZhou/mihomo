@@ -202,7 +202,7 @@ func TestCandidateRematchCompletesBeforeComparison(t *testing.T) {
 	}
 }
 
-func TestV2AmbiguitySkipsSniffWithoutInventingHost(t *testing.T) {
+func TestV2AmbiguityAllowsSniffWithoutInventingHost(t *testing.T) {
 	enableMappingTest(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(domainmapping.Result{Version: 2, Status: "ambiguous", IP: r.URL.Query().Get("ip"), Scope: "client", ExpiresAt: time.Now().Add(time.Minute), Domains: []string{"a.example", "b.example"}, Complete: true, Total: 2})
 	}, func(cfg *domainmapping.Config) { cfg.Providers[0].Type = "mosdns-http-v2" })
@@ -213,8 +213,8 @@ func TestV2AmbiguitySkipsSniffWithoutInventingHost(t *testing.T) {
 	m = realMetadata()
 	m.NetWork = C.UDP
 	sender := &mappingSniffSender{}
-	if err := prepareUDPDomain(m, sender); err != nil || sender.sniffed || !sender.skipped || m.Host != "" {
-		t.Fatalf("ambiguous UDP sniffed: %+v %+v %v", m, sender, err)
+	if err := prepareUDPDomain(m, sender); err != nil || !sender.sniffed || sender.skipped || m.Host != "" || m.RuleHost() != "payload.example" {
+		t.Fatalf("ambiguous UDP did not accept reliable payload: %+v %+v %v", m, sender, err)
 	}
 }
 

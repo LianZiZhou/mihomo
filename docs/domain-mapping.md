@@ -6,9 +6,37 @@
 
 长期维护入口为 [Mihomo fork 的 Meta](https://github.com/LianZiZhou/mihomo/tree/Meta) 与 [MosDNS fork 的 main](https://github.com/LianZiZhou/mosdns/tree/main)。`Meta` 是此 Mihomo fork 的默认分支。
 
-## 客户端真实 IP 分配与共享候选（v2）
+## 原生式小容量 DNS 线索（v3，推荐）
 
-新部署推荐 `mosdns-http-v2`，配合 MosDNS 的 `allocation.client_scope`。v1 保留原行为，以便独立升级和回滚。v2 不把共享地址的最新 DNS 域名当作唯一归属。
+新部署使用 `mosdns-http-v3`。MosDNS 用默认 **4096 个 `(客户端, IP)` 条目**的独立 LRU 保存最新实际 DNS 域名；新响应覆盖旧线索，容量压力淘汰冷条目。连接查询只提升该条目的 LRU 位置，不把访问当作新的 DNS 观察。不要将分配历史的大容量索引等同于路由线索缓存。
+
+```yaml
+domain-mapping:
+  enable: true
+  timeout: 50
+  max-connections: 16
+  max-inflight: 128
+  providers:
+    - name: mosdns
+      type: mosdns-http-v3
+      endpoint: http://127.0.0.1:9091/plugins/domain_index/v3/lookup
+```
+
+升级时删除 `conflict-policy` 和 `conflict-fallback`。v3 配置拒绝这两个字段，也拒绝与 v1/v2 provider 混用，避免 miss 后恢复旧的全历史代理优先策略。v1/v2 仍保留兼容接口，建议仅用于回滚；下文描述其旧协议。
+
+v3 返回 `version:3`、`status:hit|miss`、`ip`、`scope`，命中包含 `domain`、`observed_at`、`retention_mode:lru`、`domains`、`candidates_complete`，以及可选的 DNS 新鲜度、`generation`、`allocation_recovering`。`domains` 最多 32 项，仅代表从最后实际 DNS 观察计算的近期证据；它可能为空，最新 hint 仍可因 LRU 保留。带 client 的查询只能接受 client scope，不允许借全局记录补齐。恢复状态不会禁用新线索，也不会指定任何出站。
+
+选路顺序是：可靠的连接嗅探域名优先；没有嗅探结果时，对近期候选使用本条连接的来源、端口、协议、进程及当前完整规则判断是否跨策略冲突。没有冲突才使用最新 DNS hint。存在冲突、候选截断或评估不可用时清除该 hint，继续没有推断域名的原生规则匹配及 MATCH，既不固定送 AI，也不强制 DIRECT。NOT(DOMAIN,...) 等对空域名的原生匹配语义仍然保留，并非跳过所有含域名条件的规则。推测评估不更新规则计数，实际匹配仍只执行一次。单个线索无需多候选规则评估。
+
+诊断的 `decision` 为 `dns-hint`、`sniff` 或 `original-rules`，并提供 `reason`、`policyDomain`、`candidatesComplete` 与 `allocationRecovering`。后者只表示地址分配恢复状况，不表示域名身份完整性。历史 `complete` 不用于 v3 分流。
+
+TLS/QUIC 需要检查 SNI 后续扩展，发现 ECH 时不把公开外层名称当作真实目标。被动嗅探无法可靠区分 ECH 与 GREASE，因此两者都保守地依靠 DNS hint 或原规则；这可能降低使用 GREASE 的普通浏览器的报文嗅探命中率。ECH 不计入共享 IP 的嗅探失败缓存，避免妨碍后续普通 TLS 连接。
+
+这是与原生 redir-host 一致的尽力推断，不证明真实 IP 独占。相同 IP 且无可靠域名的不同连接无法始终准确区分；HTTP/2/3 跨域复用不能在同一连接内切换出口。需要严格域名身份时使用 fake-IP 或显式携带域名的代理路径。
+
+## 客户端真实 IP 分配与共享候选（v2 兼容）
+
+`mosdns-http-v2` 是旧候选竞争模式，配合 MosDNS 的 `allocation.client_scope`。v1/v2 用于兼容与回滚；长期历史、恢复保护与固定出站兜底叠加可能造成共享 CDN IP 大面积误分，应迁移到 v3。
 
 ```yaml
 domain-mapping:
@@ -39,7 +67,7 @@ v2 lookup 使用 `GET /plugins/domain_index/v2/lookup?ip=...&client=...`，不�
 - 策略冲突时才应用 `conflict-policy`。`proxy-preferred`（默认）保护候选实际命中的显式域名代理规则，显式拒绝优先；多个保护目标按完整规则路径排序。`rule-priority` 则直接选择配置顺序中最早的候选结果。二者都可能影响共享地址上的其他域名，这是兜底策略，不能视作准确识别。
 - 候选不完整、规则快照失败或评估预算耗尽时，先按原顺序检查能够证明不依赖未知域名的连接属性规则，例如前置 IP REJECT；遇到无法确定的域名条件后才使用 `conflict-fallback`（默认 REJECT）。可显式设置需要保护的策略组。该策略必须存在，不能使用 PASS、REMATCH 等非终止策略；UDP 还要求支持 UDP。错误配置会使该连接选路失败。
 
-共享结果不会填写虚假的 `domainMappingHost`，也不会因没有唯一域名就意外触发 sniff。诊断额外包含 `candidateCount`、`complete`、`generation`、`decision`（`consensus` 或 `fallback`）、`policy`、`policyDomain`（仅冲突决策的依据）和 `reason`。实际 TCP/UDP 目标 IP 保持不变；已有连接不重新分流。
+共享结果不会填写虚假的 `domainMappingHost`，仍允许已配置的连接嗅探纠正 DNS 歧义。诊断额外包含 `candidateCount`、`complete`、`generation`、`decision`（`consensus` 或 `fallback`）、`policy`、`policyDomain`（仅冲突决策的依据）和 `reason`。实际 TCP/UDP 目标 IP 保持不变；已有连接不重新分流。
 
 AND/OR/NOT 在单个候选内评估，SUB-RULE 按完整子规则路径排序。规则、provider 和 GEOSITE 使用冻结视图；每个候选先在私有元数据上完成 REMATCH 的纯转换，再比较最终策略，只有获选路径提交统计及元数据。未就绪或含无法解析条目的 provider 不能证明未命中，配置挂起期间也不签发共享分类。处理过程有 50 ms 检查预算、一百万步和递归限制，失败进入显式兜底；这不承诺硬实时上限，调度、GC、原生规则操作及正则超时检测仍可能有额外延迟。普通唯一查询不执行多候选评估，也不新增分类 RPC。
 
@@ -69,10 +97,10 @@ domain-mapping:
 | `max-inflight` | 当前运行时全部未完成的共享查询上限；省略或 `0` 使用 **128**。等待连接以及超时后仍未退出的 provider 工作也计入。负值无效。 |
 | `providers` | 按配置顺序查询；第一个有效命中结束查询，未命中或失败时在剩余预算内继续后续 provider。 |
 | `name` | 必填且不能重名，用于连接诊断。 |
-| `type` | 支持 `mosdns-http-v1` 和 `mosdns-http-v2`，须与 endpoint 版本对应。 |
+| `type` | 支持 `mosdns-http-v1`、`mosdns-http-v2` 和推荐的 `mosdns-http-v3`，须与 endpoint 版本对应。 |
 | `endpoint` | 完整 HTTP(S) lookup URL；`domain_index` 必须与 MosDNS 插件 tag 一致。不能包含 URL 用户名、密码或 fragment。 |
 
-该功能独立于 `dns.enable` 和 `sniffer.enable`：关闭内置 DNS、关闭报文嗅探时仍可使用。若开启现有 sniffer，外部映射未命中时仍有原来的嗅探回退路径。
+该功能独立于 `dns.enable` 和 `sniffer.enable`：关闭内置 DNS、关闭报文嗅探时仍可使用。若开启现有 sniffer，报文域名可纠正外部映射，包括映射命中时。
 
 MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 provider 未增加身份认证参数，不能将无认证的索引 API 暴露到不可信网络。HTTP 查询直接连接配置的服务，不使用系统 HTTP 代理，也不经过 Mihomo 自己的代理选择；不接受 HTTP 重定向。
 
@@ -83,11 +111,12 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 查询只针对没有显式入站域名、拥有真实目标 IP 的连接。显式入站域名及已配置 fake-IP 池中的地址沿用既有处理；fake-IP 映射缺失时，也不会借外部结果绕过原错误处理。
 
 - **TCP**：每条新连接在内置真实 IP 映射和报文嗅探之前查询外部 provider。
-- **UDP**：每个新 NAT 会话在首次异步选路协程中查询，不阻塞公共收包入口；等待期间首包进入既有发送队列。命中会释放 QUIC 嗅探状态，保留待发送数据。
-- **命中**：写入仅供规则使用的 `DomainMappingHost`，跳过报文嗅探和内置 IP 到域名的替换，不修改 `Host` 或 `DstIP`，也不重新解析返回的域名。
-- **未命中、容量饱和、异常或超时**：继续已有的内置映射、嗅探及规则流程。UDP 保留其原有的嗅探与元数据预处理顺序。
+- **UDP**：每个新 NAT 会话在首次异步选路协程中查询，不阻塞公共收包入口；等待期间首包进入既有发送队列。保留 QUIC 嗅探状态和待发送数据，继续读取可靠的报文域名。
+- **命中**：写入仅供规则使用的 `DomainMappingHost`，跳过内置 IP 到域名的替换，允许已配置的报文嗅探纠正线索，不修改 `Host` 或 `DstIP`，也不重新解析返回的域名。
+- **未命中、容量饱和、异常或超时**：v3 不再读取内置全局真实 IP 映射，防止从其他客户端的旧线索恢复错误域名；继续已配置的嗅探和没有推断域名的原生规则匹配。v1/v2 兼容模式仍可回退内置映射。显式入站域名、fake-IP 继续使用原生身份处理。
+- **UDP force-dns-mapping**：创建发送器前仅检查运行时模式和真实 IP 资格，以便安装 QUIC 嗅探包装；查询仍在异步首次选路协程进行，公共收包入口不执行 HTTP。即使 parse-pure-ip 为 false，也可纠正外部 DNS hint。
 
-`Metadata.RuleHost()` 的优先级为 `DomainMappingHost → SniffHost → Host`。因此 DOMAIN、DOMAIN-SUFFIX 等域名规则可使用映射证据，拨号仍使用原目标 IP。此改动没有调整负载均衡按 `Host` 计算哈希等既有语义。
+`Metadata.RuleHost()` 的优先级为 `SniffHost → DomainMappingHost → Host`。因此 DOMAIN、DOMAIN-SUFFIX 等域名规则可使用映射证据，拨号仍使用原目标 IP。此改动没有调整负载均衡按 `Host` 计算哈希等既有语义。
 
 连接 API 的 metadata 新增如下字段，旧面板可能仍只展示 `host` 或目标 IP：
 
@@ -111,9 +140,9 @@ MosDNS API 应只监听可信本机地址，例如 `127.0.0.1:9091`。这里的 
 
 相同客户端 IP 与目标 IP 的并发查询共享一个在途请求。单个调用方取消等待，不会取消其他调用方共享的查询。完成后的成功结果、未命中和错误均不缓存：共享 IP 的域名归属可能在旧记录 TTL 到期前发生变化。HTTP 连接本身继续复用，不执行应用层重试。
 
-MosDNS 支持独立的证据保留策略，推荐在其 `domain_mapping.args` 设置 `size: 262144` 和 `retention: {mode: lru, ttl_multiplier: 10, min_window: 300, max_window: 86400}`。`lru` 不因 DNS TTL 或路由窗口届满删除映射，直到容量淘汰；同客户端路由命中刷新有效期至至少 `now + clamp(10 × baseTTL, 300s, 86400s)`。例如 TTL 300 秒，每次命中延至至少 50 分钟后。仅修改 Mihomo 的 DNS cache 大小或 fake-IP TTL 不会改变 MosDNS 这份索引。完整配置见 [MosDNS 保留策略](https://github.com/LianZiZhou/mosdns/blob/main/docs/mihomo-bridge.md#dns-到期路由续期与容量淘汰)。
+v3 使用 MosDNS 独立的小容量路由 LRU（默认 4096 条），不依赖旧分配历史索引的容量和保留窗口。过去建议的大容量全历史索引与访问续期不再作为分流依据；近期冲突窗口只从真实 DNS 观察计算，连接访问不会刷新历史事实。仅修改 Mihomo 内置 DNS cache 大小或 fake-IP TTL 不会改变 MosDNS 的缓存。
 
-使用新策略时，连接诊断额外包含 `dnsExpiresAt`、`dnsStale`（为 true 时输出）和 `retentionMode`；`expiresAt` 表示查询返回时的路由有效期。真实 DNS 截止已过去而路由证据仍有效是正常情况。上述字段是创建连接时的快照，已有连接不随 DNS TTL 或路由有效期到期而重新分流。Mihomo 仍校验 `expires_at` 晚于当前时间，不会因 `dns_stale=true` 接受已过期的路由租约。
+连接诊断可包含 `dnsExpiresAt`、`dnsStale`（为 true 时输出）和 `retentionMode`。这些是创建连接时的快照，已有连接不随 DNS TTL 到期重新分流。v3 的 LRU hint 没有路由租约；只有旧 v1/v2 才要求 `expires_at` 晚于当前时间，且不会因 `dns_stale=true` 接受已过期的旧路由租约。
 
 共享请求使用固定截止时间，后加入者只等待剩余预算；已过期但尚未退出的 provider 不会让新请求继承旧超时。等待方独立执行超时回退，provider 在截止时间之后返回的结果不会应用到分流。
 
@@ -172,7 +201,7 @@ Mihomo 始终设置 `view=route`，请求仅包含选中域名证据的精简 JS
 
 两者均返回 HTTP 200；非法请求参数由 MosDNS 返回 400。客户端要求响应 `version=1`、`ip` 与请求匹配、状态为 `hit` 或 `miss`；命中时还要求合法域名、`scope` 为 `client` 或 `global`，且 **`expires_at` 必填并晚于当前时间**。时间使用 Go `time.Time` 兼容的 RFC3339/RFC3339Nano 格式。域名统一小写并去除一个末尾点。非 200 响应、无效 JSON、过期证据或超过 1 MiB 的应答均按查询失败回退。
 
-MosDNS 优先客户端索引，再回退全局索引。多个保留的域名候选存在时，服务端选择最近实际 DNS 观察的域名并设置 `conflict=true`；路由查询续期只改变访问热度和有效期，不改变 DNS 观察顺序。Mihomo 使用服务返回的选中域名，诊断字段保留冲突信息。LRU 保留会延长歧义记录的寿命，不能证明选中的域名就是应用真实意图。
+v1 兼容接口优先客户端索引，再回退全局索引；v3 不允许这种跨客户端回退。多个保留的域名候选存在时，服务端选择最近实际 DNS 观察的域名并设置 `conflict=true`；路由查询续期只改变访问热度和有效期，不改变 DNS 观察顺序。Mihomo 使用服务返回的选中域名，诊断字段保留冲突信息。LRU 保留会延长歧义记录的寿命，不能证明选中的域名就是应用真实意图。
 
 v1 可选字段 `dns_expires_at`、`dns_stale`、`retention_mode` 只用于诊断；`expires_at` 始终是 provider 接受命中的有效期判据。旧服务不提供这些字段时保持原行为，旧 Mihomo 也可忽略新字段并使用新 MosDNS 返回的未来路由有效期。新模式不会增加协议版本探测或额外查询。
 
@@ -212,7 +241,7 @@ go test ./component/domainmapping ./constant ./component/sniffer ./tunnel ./conf
 go vet ./component/domainmapping ./constant ./component/sniffer ./tunnel ./config ./hub/executor
 ```
 
-测试覆盖协议验证、过期、超时恢复、HTTP 连接复用、无正负结果缓存、并发合并与独立取消、客户端隔离、多 provider 顺序、重载、独立于 DNS 的配置、规则域名和目的 IP 保持、fake-IP/显式域名兼容、TCP 跳过嗅探、UDP 入口非阻塞和排队数据保留。资源限制的验收包括连接队列使用原预算、饱和后既有共享仍可加入、迟到 provider 继续占用额度直到退出及 TCP/TLS 取消回收。真实 TLS 回归覆盖 HTTP/2 单流饱和恢复、多流响应并行、冷启动与连接重建后的突发、GOAWAY 清理、活动流退休及 HTTPS HTTP/1.1 回退；跨进程脚本还覆盖新 Mihomo 与忽略 `view` 的旧 API 兼容。
+测试覆盖协议验证、过期、超时恢复、HTTP 连接复用、无正负结果缓存、并发合并与独立取消、客户端隔离、多 provider 顺序、重载、独立于 DNS 的配置、规则域名和目的 IP 保持、fake-IP/显式域名兼容、TCP/UDP 嗅探纠正映射、UDP 入口非阻塞和排队数据保留。资源限制的验收包括连接队列使用原预算、饱和后既有共享仍可加入、迟到 provider 继续占用额度直到退出及 TCP/TLS 取消回收。真实 TLS 回归覆盖 HTTP/2 单流饱和恢复、多流响应并行、冷启动与连接重建后的突发、GOAWAY 清理、活动流退休及 HTTPS HTTP/1.1 回退；跨进程脚本还覆盖新 Mihomo 与忽略 `view` 的旧 API 兼容。
 
 性能验收应同时观察映射查询延迟、DNS 应答延迟和资源峰值，覆盖大索引桶、批量过期、突发新目标及不可用 provider。容量限制与精简 JSON 不构成目标设备 p99 延迟的保证；ARM/MIPS 设备仍需实测。
 

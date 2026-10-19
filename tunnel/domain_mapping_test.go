@@ -191,7 +191,7 @@ func TestMappingPreservesExplicitHostAndFakeIPBehavior(t *testing.T) {
 	}
 }
 
-func TestTCPEntryMappingSkipsSniffer(t *testing.T) {
+func TestTCPEntryMappingAllowsPayloadCorrection(t *testing.T) {
 	enableMappingTest(t, mappingHitHandler)
 	previousStatus, previousSniffing, previousDispatcher := Status(), sniffingEnable, snifferDispatcher
 	OnRunning()
@@ -201,30 +201,30 @@ func TestTCPEntryMappingSkipsSniffer(t *testing.T) {
 	})
 	dispatcher, err := sniffer.NewDispatcher(&sniffer.Config{
 		Enable: true, ParsePureIp: true,
-		Sniffers: map[ST.Type]sniffer.SnifferConfig{ST.HTTP: {OverrideDest: true}},
+		Sniffers: map[ST.Type]sniffer.SnifferConfig{ST.HTTP: {OverrideDest: false}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	UpdateSniffer(dispatcher)
 	metadata := realMetadata()
+	metadata.DstPort = 80
 	metadata.SpecialProxy = "__missing_test_proxy__" // end after domain preparation
 	inbound, client := net.Pipe()
 	defer client.Close()
 	defer inbound.Close()
 	done := make(chan struct{})
 	go func() { handleTCPConn(icontext.NewConnContext(inbound, metadata)); close(done) }()
-	// A sniffer would wait for the client's first payload for one second. DNS
-	// evidence can route even server-first or encrypted, unrecognizable flows.
+	go func() { _, _ = client.Write([]byte("GET / HTTP/1.1\r\nHost: payload.example\r\n\r\n")) }()
 	select {
 	case <-done:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		_ = client.Close()
 		<-done
-		t.Fatal("mapping hit entered payload sniffing")
+		t.Fatal("payload sniffing did not finish")
 	}
-	if metadata.RuleHost() != "mapped.example" || metadata.SniffHost != "" || metadata.Host != "" || metadata.DstIP != realMetadata().DstIP {
-		t.Fatalf("TCP mapping did not preserve target: %+v", metadata)
+	if metadata.RuleHost() != "payload.example" || metadata.DomainMappingHost != "mapped.example" || metadata.Host != "" || metadata.DstIP != realMetadata().DstIP {
+		t.Fatalf("TCP payload did not correct hint while preserving target: %+v", metadata)
 	}
 }
 
@@ -241,7 +241,7 @@ func (s *mappingSniffSender) DoSniff(metadata *C.Metadata) error {
 	return nil
 }
 
-func TestUDPMappingSkipsPayloadAndFallsBackOnMissOrError(t *testing.T) {
+func TestUDPMappingAllowsPayloadForHitMissAndError(t *testing.T) {
 	for _, response := range []string{"hit", "miss", "error"} {
 		t.Run(response, func(t *testing.T) {
 			enableMappingTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -260,11 +260,7 @@ func TestUDPMappingSkipsPayloadAndFallsBackOnMissOrError(t *testing.T) {
 			if err := prepareUDPDomain(metadata, sender); err != nil {
 				t.Fatal(err)
 			}
-			if response == "hit" {
-				if sender.sniffed || !sender.skipped || metadata.RuleHost() != "mapped.example" {
-					t.Fatalf("hit did not bypass payload sniff: %+v, %+v", metadata, sender)
-				}
-			} else if !sender.sniffed || sender.skipped || metadata.RuleHost() != "payload.example" || metadata.DomainResolution.LookupStatus != response {
+			if !sender.sniffed || sender.skipped || metadata.RuleHost() != "payload.example" || metadata.DomainResolution.LookupStatus != response {
 				t.Fatalf("fallback failed: %+v, %+v", metadata, sender)
 			}
 			if metadata.Host != "" || metadata.DstIP != originalIP {

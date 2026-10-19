@@ -14,6 +14,7 @@ import (
 var (
 	errNotTLS         = errors.New("not TLS header")
 	errNotClientHello = errors.New("not client hello")
+	errECHClientHello = errors.New("ECH outer ClientHello is not a reliable target domain")
 )
 
 const (
@@ -74,8 +75,8 @@ func IsValidTLSVersion(major, minor byte) bool {
 	return major == 3
 }
 
-// ReadClientHello returns the server name as soon as its complete field is
-// available in a ClientHello prefix, including the four-byte handshake header.
+// ReadClientHello returns SNI only after checking the remaining extensions.
+// ECH may follow server_name, whose public outer name is not the real target.
 // https://github.com/golang/go/blob/master/src/crypto/tls/handshake_messages.go#L300
 func ReadClientHello(data []byte) (*string, error) {
 	if len(data) == 0 {
@@ -158,6 +159,7 @@ func ReadClientHello(data []byte) (*string, error) {
 		return nil, errNotClientHello
 	}
 
+	var serverName *string
 	for offset < extensionsEnd {
 		if err := need(offset + 4); err != nil {
 			return nil, err
@@ -168,6 +170,9 @@ func ReadClientHello(data []byte) (*string, error) {
 		extensionEnd := offset + length
 		if extensionEnd > extensionsEnd {
 			return nil, errNotClientHello
+		}
+		if extension == 0xfe0d { // encrypted_client_hello; GREASE is conservatively unknown too
+			return nil, errECHClientHello
 		}
 
 		if extension == 0x00 { /* extensionServerName */
@@ -198,23 +203,21 @@ func ReadClientHello(data []byte) (*string, error) {
 					return nil, err
 				}
 				if nameType == 0 {
-					serverName := string(data[offset:nameEnd])
+					name := string(data[offset:nameEnd])
 					// An SNI value may not include a
 					// trailing dot. See
 					// https://tools.ietf.org/html/rfc6066#section-3.
-					if strings.HasSuffix(serverName, ".") {
+					if strings.HasSuffix(name, ".") || serverName != nil {
 						return nil, errNotClientHello
 					}
 
-					return &serverName, nil
+					serverName = &name
 				}
 				offset = nameEnd
 			}
 		} else {
-			if extensionEnd == extensionsEnd {
-				// This is the last extension, so its payload cannot contain a
-				// later server_name extension that changes the verdict.
-				return nil, errNotTLS
+			if extensionEnd == extensionsEnd && serverName == nil {
+				return nil, errNotTLS // no later extension can provide SNI
 			}
 			if err := need(extensionEnd); err != nil {
 				return nil, err
@@ -223,6 +226,9 @@ func ReadClientHello(data []byte) (*string, error) {
 		}
 	}
 
+	if serverName != nil {
+		return serverName, nil
+	}
 	return nil, errNotTLS
 }
 

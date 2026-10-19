@@ -39,6 +39,7 @@ type Runtime struct {
 	retired          atomic.Bool
 	conflictPolicy   string
 	conflictFallback string
+	nativeHint       bool
 }
 
 func New(cfg Config) (*Runtime, error) {
@@ -72,6 +73,7 @@ func New(cfg Config) (*Runtime, error) {
 		maxConnections = DefaultMaxConnections
 	}
 	for _, cfg := range cfg.Providers {
+		runtime.nativeHint = cfg.Type == "mosdns-http-v3" // validation forbids mixed modes
 		provider, err := newHTTPProvider(cfg, runtime.timeout, maxConnections)
 		if err != nil {
 			runtime.Retire()
@@ -81,6 +83,10 @@ func New(cfg Config) (*Runtime, error) {
 	}
 	return runtime, nil
 }
+
+// NativeHintMode is immutable and safe to inspect in the UDP receive loop.
+// It performs no network or resolver work.
+func (r *Runtime) NativeHintMode() bool { return r != nil && r.nativeHint }
 
 func (r *Runtime) Lookup(ctx context.Context, clientIP, destinationIP netip.Addr) (Result, error) {
 	if r == nil {

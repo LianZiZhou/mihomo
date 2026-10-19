@@ -227,25 +227,28 @@ type Metadata struct {
 	DomainMappingHandled    bool     `json:"-"`
 	DomainMappingPolicy     string   `json:"-"`
 	DomainMappingFallback   string   `json:"-"`
+	DomainMappingNativeHint bool     `json:"-"`
 }
 
 type DomainResolution struct {
-	Provider       string     `json:"provider,omitempty"`
-	Source         string     `json:"source,omitempty"`
-	LookupStatus   string     `json:"lookupStatus"`
-	Scope          string     `json:"scope,omitempty"`
-	Conflict       bool       `json:"conflict"`
-	ExpiresAt      time.Time  `json:"expiresAt,omitempty"`
-	DNSExpiresAt   *time.Time `json:"dnsExpiresAt,omitempty"`
-	DNSStale       bool       `json:"dnsStale,omitempty"`
-	RetentionMode  string     `json:"retentionMode,omitempty"`
-	CandidateCount int        `json:"candidateCount,omitempty"`
-	Complete       bool       `json:"complete,omitempty"`
-	Generation     uint64     `json:"generation,omitempty"`
-	Decision       string     `json:"decision,omitempty"`
-	Policy         string     `json:"policy,omitempty"`
-	PolicyDomain   string     `json:"policyDomain,omitempty"`
-	Reason         string     `json:"reason,omitempty"`
+	Provider             string     `json:"provider,omitempty"`
+	Source               string     `json:"source,omitempty"`
+	LookupStatus         string     `json:"lookupStatus"`
+	Scope                string     `json:"scope,omitempty"`
+	Conflict             bool       `json:"conflict"`
+	ExpiresAt            time.Time  `json:"expiresAt,omitempty"`
+	DNSExpiresAt         *time.Time `json:"dnsExpiresAt,omitempty"`
+	DNSStale             bool       `json:"dnsStale,omitempty"`
+	RetentionMode        string     `json:"retentionMode,omitempty"`
+	CandidateCount       int        `json:"candidateCount,omitempty"`
+	Complete             bool       `json:"complete,omitempty"`
+	Generation           uint64     `json:"generation,omitempty"`
+	Decision             string     `json:"decision,omitempty"`
+	Policy               string     `json:"policy,omitempty"`
+	PolicyDomain         string     `json:"policyDomain,omitempty"`
+	Reason               string     `json:"reason,omitempty"`
+	CandidatesComplete   bool       `json:"candidatesComplete,omitempty"`
+	AllocationRecovering bool       `json:"allocationRecovering,omitempty"`
 }
 
 func (m *Metadata) RemoteAddress() string {
@@ -297,11 +300,11 @@ func (m *Metadata) Resolved() bool {
 }
 
 func (m *Metadata) RuleHost() string {
-	if m.DomainMappingHost != "" {
-		return m.DomainMappingHost
-	}
 	if m.SniffHost != "" {
 		return m.SniffHost
+	}
+	if m.DomainMappingHost != "" {
+		return m.DomainMappingHost
 	}
 	return m.Host
 }

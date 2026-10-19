@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -183,6 +184,7 @@ func TestQUICHeaders(t *testing.T) {
 		input   []string
 		domain  string
 		invalid bool
+		ech     bool
 	}{
 		// Normal domain quic sniff
 		{
@@ -204,6 +206,7 @@ func TestQUICHeaders(t *testing.T) {
 			},
 			name:   "fragmented nginx",
 			domain: "quic.nginx.org",
+			ech:    true,
 		},
 		{
 			input: []string{
@@ -212,6 +215,7 @@ func TestQUICHeaders(t *testing.T) {
 			},
 			name:   "fragmented openai",
 			domain: "chat.openai.com",
+			ech:    true,
 		},
 		// Fragmented quic and 0-rtt packet sniff
 		{
@@ -222,6 +226,7 @@ func TestQUICHeaders(t *testing.T) {
 			},
 			name:   "fragmented with zero rtt",
 			domain: "fonts.gstatic.com",
+			ech:    true,
 		},
 		// Test sniffer packet out of order
 		{
@@ -231,6 +236,7 @@ func TestQUICHeaders(t *testing.T) {
 			},
 			name:   "out of order duplicate fragments",
 			domain: "ogads-pa.clients6.google.com",
+			ech:    true,
 		},
 		{
 			input: []string{
@@ -246,6 +252,7 @@ func TestQUICHeaders(t *testing.T) {
 			},
 			name:   "many out of order fragments",
 			domain: "www.google.com",
+			ech:    true,
 		},
 		// invalid packet
 		{
@@ -277,6 +284,14 @@ func TestQUICHeaders(t *testing.T) {
 
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			probe := &quicPacketSender{done: make(chan struct{})}
+			foundECH := false
+			for _, raw := range test.input {
+				b, _ := hex.DecodeString(raw)
+				foundECH = errors.Is(probe.readQUICData(b), errECHClientHello) || foundECH
+			}
+			probe.close()
+			assert.Equal(t, test.ech, foundECH, "fixture ECH extension classification")
 			modes := []struct {
 				name             string
 				async            bool
@@ -294,8 +309,12 @@ func TestQUICHeaders(t *testing.T) {
 				t.Run(mode.name, func(t *testing.T) {
 					data, host, err := testQUICSniffer(test.input, mode.async, mode.staleInitialKeys)
 					require.NoError(t, err)
-					assert.Equal(t, test.domain, data)
-					if test.invalid {
+					if test.ech {
+						assert.Empty(t, data, "ECH/GREASE public SNI cannot claim target identity")
+					} else {
+						assert.Equal(t, test.domain, data)
+					}
+					if test.invalid || test.ech {
 						assert.Equal(t, fakeHost, host)
 					} else {
 						assert.Equal(t, test.domain, host)
@@ -381,6 +400,10 @@ func TestQUICHeaders(t *testing.T) {
 		assert.Less(t, q.contiguousCryptoEnd, uint64(len(clientHello)))
 
 		domain, err := q.tryAssemble()
+		require.NoError(t, err)
+		assert.Empty(t, domain, "SNI must wait until trailing ECH extensions can be ruled out")
+		require.NoError(t, q.addCryptoData(uint64(prefixLen), clientHello[prefixLen:]))
+		domain, err = q.tryAssemble()
 		require.NoError(t, err)
 		assert.Equal(t, "example.com", domain)
 	})
@@ -676,14 +699,14 @@ func TestTLSHeaders(t *testing.T) {
 			domain: "example.com",
 		},
 		{
-			name:   "server name before client hello padding",
-			input:  paddedRecord,
-			domain: "example.com",
+			name:  "server name before client hello padding",
+			input: paddedRecord,
+			err:   true,
 		},
 		{
-			name:   "server name across records before padding",
-			input:  fragmentedPaddedRecord,
-			domain: "example.com",
+			name:  "server name across records before padding",
+			input: fragmentedPaddedRecord,
+			err:   true,
 		},
 		{
 			name:   "client hello before incomplete record tail",

@@ -204,8 +204,8 @@ func (q *quicPacketSender) Close() {
 }
 
 // SkipSniff discards sniffing state without closing the packet sender or
-// dropping its queued datagrams. External DNS evidence already chose the rule
-// domain, so a completed or concurrent QUIC sniff must not replace it.
+// dropping its queued datagrams. This is an explicit cancellation hook; DNS
+// hints must not call it because payload evidence can correct those hints.
 func (q *quicPacketSender) SkipSniff() {
 	q.lock.Lock()
 	q.skipped = true

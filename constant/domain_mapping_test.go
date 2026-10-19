@@ -9,8 +9,8 @@ import (
 
 func TestDomainMappingRuleHostAndJSON(t *testing.T) {
 	m := &Metadata{Host: "inbound.example", SniffHost: "payload.example", DomainMappingHost: "dns.example", DstIP: netip.MustParseAddr("203.0.113.5"), DomainResolution: &DomainResolution{Provider: "mosdns", LookupStatus: "hit", Scope: "client"}}
-	if m.RuleHost() != "dns.example" || m.Clone().RuleHost() != "dns.example" {
-		t.Fatal("mapping evidence must have rule precedence and survive Clone")
+	if m.RuleHost() != "payload.example" || m.Clone().RuleHost() != "payload.example" {
+		t.Fatal("payload evidence must correct DNS hints and survive Clone")
 	}
 	encoded, err := json.Marshal(m)
 	if err != nil || !strings.Contains(string(encoded), `"domainMappingHost":"dns.example"`) || !strings.Contains(string(encoded), `"domainResolution":`) {

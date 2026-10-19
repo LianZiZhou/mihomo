@@ -291,7 +291,7 @@ func needLookupIP(metadata *C.Metadata) bool {
 }
 
 func preHandleMetadata(metadata *C.Metadata) error {
-	if metadata.DomainMappingHost != "" || metadata.DomainMappingHandled {
+	if metadata.DomainMappingHost != "" || metadata.DomainMappingHandled || metadata.DomainMappingNativeHint {
 		return nil // external DNS evidence affects rules, never the dial address
 	}
 	// preprocess enhanced-mode metadata
@@ -438,6 +438,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
+	markNativeDomainMapping(metadata)
 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
 		packet.Drop()
 		log.Debugln("[Metadata PreHandle] error: %s", err)
@@ -521,7 +522,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
-	mappingHit := lookupDomainMapping(context.Background(), metadata)
+	lookupDomainMapping(context.Background(), metadata)
 	preHandleFailed := false
 	if err := preHandleMetadata(metadata); err != nil {
 		log.Debugln("[Metadata PreHandle] error: %s", err)
@@ -530,7 +531,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	conn := connCtx.Conn()
 	conn.ResetPeeked() // reset before sniffer
-	if !mappingHit && sniffingEnable && snifferDispatcher.Enable() {
+	if sniffingEnable && snifferDispatcher.Enable() {
 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
 		if snifferDispatcher.TCPSniff(conn, metadata) {
@@ -660,7 +661,10 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
 	configMux.RLock()
 	defer configMux.RUnlock()
-	if metadata.DomainMappingHandled && metadata.DomainResolution != nil && metadata.DomainResolution.LookupStatus == "ambiguous" {
+	if metadata.DomainMappingNativeHint {
+		prepareNativeDomainHint(metadata, helper)
+	}
+	if metadata.SniffHost == "" && metadata.DomainMappingHandled && metadata.DomainResolution != nil && metadata.DomainResolution.LookupStatus == "ambiguous" {
 		return matchDomainCandidates(metadata, helper)
 	}
 

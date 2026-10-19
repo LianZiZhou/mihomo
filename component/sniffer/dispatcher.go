@@ -64,7 +64,7 @@ func (sd *Dispatcher) shouldOverride(metadata *C.Metadata) bool {
 	if metadata.Host == "" && sd.parsePureIp {
 		return true
 	}
-	if metadata.DNSMode == C.DNSMapping && sd.forceDnsMapping {
+	if (metadata.DNSMode == C.DNSMapping || metadata.DomainMappingHandled || metadata.DomainMappingNativeHint) && sd.forceDnsMapping {
 		return true
 	}
 	return sd.forceSniff(metadata)
@@ -146,7 +146,7 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool 
 
 		host, config, err := sd.sniffDomain(conn, metadata)
 		if err != nil {
-			if !forceSniffer {
+			if !forceSniffer && !errors.Is(err, errECHClientHello) {
 				sd.cacheSniffFailed(metadata)
 			}
 			log.Debugln("[Sniffer] All sniffing sniff failed with from [%s:%d] to [%s:%d]", metadata.SrcIP, metadata.SrcPort, metadata.String(), metadata.DstPort)
@@ -269,6 +269,9 @@ func (sd *Dispatcher) sniffDomain(conn *N.BufferedConn, metadata *C.Metadata) (s
 			// this snapshot. Leave larger requests paused until enough data exists.
 			if current.want <= len(data) {
 				host, err := current.SniffData(data)
+				if errors.Is(err, errECHClientHello) {
+					return "", SnifferConfig{}, err
+				}
 				if err == nil {
 					if isValidSniffHost(host) {
 						return host, current.config, nil
